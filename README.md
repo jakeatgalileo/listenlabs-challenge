@@ -48,3 +48,6 @@ python bouncer.py \
 - Selection: `bouncer.py` dynamically imports `scenario{scenario}.py` and calls its `decide(...)`.
 - Independence: These modules are self-contained (no imports from `bouncer.py`). Each implements its own heuristics and feasibility checks.
 - Customizing: Tweak per-scenario heuristics directly in those files. The CLI continues to manage networking and passes minimal state to each strategy.
+
+Environment knobs:
+  (none specific to Scenario 1 at this time)

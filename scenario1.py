@@ -75,11 +75,43 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     if n1 > 0 and n2 > 0:
         return has1 or has2
 
-    # Phase B: one met, the other not -> accept only if candidate has the unmet attr
+    # Phase B: one met, the other not -> primarily accept candidates with the unmet attr
+    # Additionally, near the end, allow safe "wrong-side" acceptance if stats suggest
+    # we can still reach the unmet minimum.
     if n1 <= 0 and n2 > 0:
-        return has2  # includes both-true
+        if has2:
+            return True
+        return _safe_wrong_side_accept(unmet_attr=a2, state=state)
     if n2 <= 0 and n1 > 0:
-        return has1  # includes both-true
+        if has1:
+            return True
+        return _safe_wrong_side_accept(unmet_attr=a1, state=state)
 
     # Fallback (should be Phase C handled above): reject neither, else accept
     return has1 or has2
+
+
+def _safe_wrong_side_accept(unmet_attr: str, state) -> bool:
+    """
+    Allow accepting a candidate who doesn't help the unmet attribute when remaining
+    capacity and estimated frequency still make meeting the minimum highly likely.
+
+    Normal-approximation lower confidence bound on future arrivals with `unmet_attr`
+    among the remaining R-1 slots. Accept if current + LCB >= minCount.
+    """
+    R = max(0, state.N - state.admitted_count)
+    if R <= 1:
+        return False
+    cur = int(state.counts.get(unmet_attr, 0))
+    M = int(state.constraints.get(unmet_attr, 0))
+    need = max(0, M - cur)
+    if need <= 0:
+        return True
+    p = float(state.freqs.get(unmet_attr, 0.2))
+    n = R - 1
+    mu = n * p
+    var = max(1e-6, n * p * (1 - p))
+    # z decays as we approach the end: early ~1.5, late ~0.5
+    z = 0.5 + 1.0 * min(1.0, max(0.0, (n / 200.0)))
+    lcb = mu - z * (var ** 0.5)
+    return (cur + lcb) >= M

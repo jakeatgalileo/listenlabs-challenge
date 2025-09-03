@@ -699,6 +699,8 @@ def main():
             accept_all_after_min_met=accept_all_flag,
         )
 
+        # (removed) previously restored scenario-specific frontload tracking
+
         # Synthesize a response so the loop can continue
         res = {
             "status": "running",
