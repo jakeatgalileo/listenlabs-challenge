@@ -114,9 +114,14 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
                 n1 = need[a1]
                 n2 = need[a2]
 
-                # Phase A: both below min -> accept if at least one attr
+                # Phase A: both below min
                 if not accept and n1 > 0 and n2 > 0:
-                    accept = has1 or has2
+                    if has1 or has2:
+                        accept = True
+                    else:
+                        # Early capacity soak: accept neither if both constraints remain safely feasible
+                        if _safe_accept_neither(state):
+                            accept = True
 
                 # Phase B: one met, the other not -> primarily accept candidates with the unmet attr
                 if not accept and n1 <= 0 and n2 > 0:
@@ -132,7 +137,11 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
 
                 # Fallback (should be Phase C handled above): reject neither, else accept if any attr
                 if not accept:
-                    accept = has1 or has2
+                    if has1 or has2:
+                        accept = True
+                    else:
+                        if _safe_accept_neither(state):
+                            accept = True
 
     # Record accepted candidate for empirical frequencies
     if accept:
@@ -187,4 +196,49 @@ def _safe_wrong_side_accept(unmet_attr: str, state) -> bool:
     if safety_margin <= 10:
         return False
 
+    return False
+
+
+def _safe_accept_neither(state) -> bool:
+    """
+    Decide whether it's safe (and beneficial) to accept a candidate with neither attribute.
+    Uses the same lower-confidence-bound feasibility check for each constraint, computed
+    over the remaining R-1 spots after taking this neither candidate.
+
+    More permissive during early buffer (admitted < 700) if both safety margins are healthy.
+    """
+    R = max(0, state.N - state.admitted_count)
+    if R <= 1:
+        return False
+    n = R - 1
+
+    attrs = list(state.constraints.keys())
+    if len(attrs) < 2:
+        return False
+
+    safety_margins = []
+    for a in attrs:
+        cur = int(state.counts.get(a, 0))
+        M = int(state.constraints.get(a, 0))
+        p = float(_adjusted_p(a, state))
+        mu = n * p
+        var = max(1e-6, n * p * (1 - p))
+        # same z policy as wrong-side acceptance
+        rem_frac = 0.0
+        if state.N > 0:
+            rem_frac = max(0.0, min(1.0, (state.N - state.admitted_count) / state.N))
+        z = 0.3 + 0.5 * rem_frac
+        lcb = mu - z * (var ** 0.5)
+        if (cur + lcb) < M:
+            return False
+        safety_margins.append(cur + mu - M)
+
+    # Both constraints feasible via LCB. Now gate permissiveness by safety margin and phase.
+    min_margin = min(safety_margins) if safety_margins else 0.0
+    # Early buffer period: accept neither to soak capacity and stay near 600/600
+    if state.admitted_count < 700 and min_margin >= 15:
+        return True
+    # If extremely safe, also allow neither regardless of phase
+    if min_margin >= 30:
+        return True
     return False
