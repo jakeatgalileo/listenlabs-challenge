@@ -1,8 +1,8 @@
 from typing import Dict, List
 
 
-# Scenario 3: stricter policy with larger endgame and a forward-looking
-# expected value check. No imports from bouncer.
+# Scenario 3: correlation-aware strategy with scarcity-weighted scoring
+# and dynamic thresholding. Standalone (no imports from bouncer).
 
 
 def _remaining(state) -> int:
@@ -11,6 +11,13 @@ def _remaining(state) -> int:
 
 def _need_map(state) -> Dict[str, int]:
     return {a: max(0, state.constraints[a] - state.counts.get(a, 0)) for a in state.constraints}
+
+
+def _all_constraints_met(state) -> bool:
+    for a, M_a in state.constraints.items():
+        if state.counts.get(a, 0) < M_a:
+            return False
+    return True
 
 
 def _hard_safety(person: Dict[str, bool], state) -> bool:
@@ -60,41 +67,113 @@ def _expected_value(person: Dict[str, bool], state, horizon: int) -> float:
     return direct - opp_cost + 0.3 * corr_bonus
 
 
+def _scarcity_map(state) -> Dict[str, float]:
+    R = max(1, _remaining(state))
+    need = _need_map(state)
+    S: Dict[str, float] = {}
+    for a in state.constraints:
+        p = max(1e-6, state.freqs.get(a, 0.0))
+        S[a] = min(6.0, need[a] / max(1.0, R * p))
+    return S
+
+
+def _weights_required_over_base(state) -> Dict[str, float]:
+    """
+    Attribute weights ~ required rate / base rate, clipped.
+    Encourages rare-but-required attributes (qf, vc, gs, intl).
+    """
+    W: Dict[str, float] = {}
+    for a, M_a in state.constraints.items():
+        req = (M_a / state.N) if state.N else 0.0
+        p = max(1e-6, state.freqs.get(a, 0.0))
+        w = req / p if p > 0 else 5.0
+        W[a] = max(0.8, min(6.0, w))
+    return W
+
+
+def _adaptive_threshold(state, rejection_history: List[int], base_start: float = 0.7, window: int = 100) -> float:
+    progress = (state.admitted_count / state.N) if state.N else 0.0
+    base = base_start * (1.0 - progress)
+
+    # Pressure from most lagging constraint
+    max_pressure = 0.0
+    for a, M_a in state.constraints.items():
+        req = (M_a / state.N) if state.N else 0.0
+        cur = state.counts.get(a, 0) / max(1, state.admitted_count)
+        max_pressure = max(max_pressure, req - cur)
+
+    if window > 0 and len(rejection_history) >= window:
+        recent = rejection_history[-window:]
+        rate = sum(recent) / window
+        if rate > 0.9:
+            base *= 0.8
+        elif rate > 0.8:
+            base *= 0.9
+        elif rate < 0.3 and max_pressure > 0.1:
+            base *= 1.15
+
+    return base + max_pressure
+
+
 def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool:
+    # 1) Hard safety: never make feasibility impossible with one rejection
     if not _hard_safety(person, state):
         return False
 
+    # 2) If all constraints are already met, accept-all to minimize rejections
+    if _all_constraints_met(state):
+        return True
+
     R = _remaining(state)
     need = _need_map(state)
+    scarcity = _scarcity_map(state)
 
-    # Strong deficit-first
+    # 3) Deficit-first: greedily accept contributors to unmet constraints
     for a in state.constraints:
         if need[a] > 0 and person.get(a, False):
             return True
 
-    # Larger endgame window with feasibility and EV check
+    # 4) High-value correlation rules (qf-vc-gs synergy)
+    qf = person.get("queer_friendly", False)
+    vc = person.get("vinyl_collector", False)
+    gs = person.get("german_speaker", False)
+
+    # Always accept qf+vc (leverages 0.48 correlation)
+    if qf and vc:
+        return True
+
+    # Strong combos with german speaker
+    if (qf and gs) or (vc and gs):
+        return True
+
+    # Scarcity-priority for rare attrs
+    criticality = 0.75
+    if (qf and scarcity.get("queer_friendly", 0.0) >= criticality) or (
+        vc and scarcity.get("vinyl_collector", 0.0) >= criticality
+    ):
+        return True
+
+    # 5) Endgame: conservative feasibility + EV
     if R <= 120:
         if not _feasible(person, state):
             return False
         return _expected_value(person, state, horizon=R) > 0.0
 
-    # Baseline scoring: stricter penalties
+    # 6) Scarcity-weighted scoring with required/base weights and correlation bonus
+    W = _weights_required_over_base(state)
     s = 0.0
-    # Scarcity
-    scarcity: Dict[str, float] = {}
-    for a in state.constraints:
-        p = max(1e-6, state.freqs.get(a, 0.0))
-        scarcity[a] = min(6.0, need[a] / max(1.0, R * p)) if R > 0 else (10.0 if need[a] > 0 else 0.0)
 
+    # Direct contribution and opportunity penalty
     for a in state.constraints:
         Sa = scarcity[a]
+        Wa = W[a]
         if person.get(a, False):
-            s += 0.85 * (1.0 + 0.6 * Sa)
+            s += 1.0 * Wa * (1.0 + 0.8 * Sa)
         else:
             if need[a] > 0:
-                s -= 0.55 * (1.0 + 0.6 * Sa)
+                s -= 0.5 * Wa * (1.0 + 0.6 * Sa)
 
-    # Correlation bonus smaller
+    # Correlation-aware bonus toward needed, scarce targets
     for at, v in person.items():
         if not v:
             continue
@@ -102,16 +181,25 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
             if need[an] <= 0:
                 continue
             c = state.corr.get(at, {}).get(an, 0.0)
-            if c > 0:
-                s += 0.12 * c * (1.0 + 0.5 * scarcity[an])
+            if c <= 0:
+                continue
+            Sa = scarcity[an]
+            Wa = W[an]
+            s += 0.3 * c * Wa * (1.0 + 0.8 * Sa)
 
-    # Dynamic threshold slightly higher baseline
-    progress = (state.admitted_count / state.N) if state.N else 0.0
-    base = 0.65 * (1.0 - progress)
-    pressure = 0.0
-    for a, M_a in state.constraints.items():
-        req = (M_a / state.N) if state.N else 0.0
-        cur = state.counts.get(a, 0) / max(1, state.admitted_count)
-        pressure = max(pressure, req - cur)
-    threshold = base + pressure
+    # 7) Adaptive threshold with recent rejection rate and pressure
+    threshold = _adaptive_threshold(
+        state,
+        rejection_history,
+        base_start=0.7,
+        window=min(100, max(10, state.total_seen if hasattr(state, "total_seen") else 100)),
+    )
+
+    # Slight easing when max scarcity is high
+    try:
+        max_s = max(scarcity.values()) if scarcity else 0.0
+        threshold *= (1.0 - min(0.2, 0.05 * max_s))
+    except Exception:
+        pass
+
     return s >= threshold
