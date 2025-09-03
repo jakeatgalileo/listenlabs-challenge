@@ -102,6 +102,17 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
                 has1 = bool(person.get(a1, False))
                 has2 = bool(person.get(a2, False))
 
+                # Simple early policy: until 90% capacity, accept anyone
+                # with at least one attribute; accept neither only if LCB
+                # feasibility holds for both constraints.
+                pre90 = state.admitted_count < int(0.9 * state.N)
+                if not accept and pre90:
+                    if has1 or has2:
+                        accept = True
+                    else:
+                        if _safe_accept_neither(state):
+                            accept = True
+
                 # Sprint-to-finish: if > 90% full and both nearly met (<=20 short), accept anyone with at least one attr
                 if state.admitted_count >= 900:
                     nearly1 = (state.constraints[a1] - state.counts.get(a1, 0)) <= 20
@@ -151,11 +162,13 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
 
 def _safe_wrong_side_accept(unmet_attr: str, state) -> bool:
     """
-    Allow accepting a candidate who doesn't help the unmet attribute when remaining
-    capacity and estimated frequency still make meeting the minimum highly likely.
+    Accept a candidate who doesn't help the unmet attribute if, after this
+    acceptance, meeting the minimum is still feasible at a conservative LCB.
 
-    Normal-approximation lower confidence bound on future arrivals with `unmet_attr`
-    among the remaining R-1 slots. Accept if current + LCB >= minCount.
+    Uses a normal-approximation lower confidence bound on future arrivals with
+    `unmet_attr` among the remaining R-1 slots. Accept if current + LCB >= minCount.
+    Removes margin/schedule gates to reduce unnecessary rejections while preserving
+    feasibility via the LCB check.
     """
     R = max(0, state.N - state.admitted_count)
     if R <= 1:
@@ -181,39 +194,18 @@ def _safe_wrong_side_accept(unmet_attr: str, state) -> bool:
     if (cur + lcb) < M:
         return False
 
-    # Schedule gate: only allow wrong-side acceptance when the unmet attribute
-    # is at/above its time-proportional schedule (with slack).
-    k = state.admitted_count
-    N = max(1, state.N)
-    # Dynamic slack: 10 early, taper to 0 by k>=800
-    if k < 800:
-        slack = int((10 * (800 - k)) / 800)
-    else:
-        slack = 0
-    target_now = (M * k + (N - 1)) // N  # ceil(M * k / N)
-    target_now += slack
-    if cur < target_now:
-        return False
-
-    # Early buffer period: allow wrong-side only with stronger margins
-    safety_margin = cur + mu - M
-    if state.admitted_count < 800 and safety_margin >= 20:
-        return True
-
-    # Always allow with very large margins
-    if safety_margin >= 40:
-        return True
-
-    return False
+    # If LCB feasibility holds, accept; drop margin-based gating for responsiveness
+    return True
 
 
 def _safe_accept_neither(state) -> bool:
     """
-    Decide whether it's safe (and beneficial) to accept a candidate with neither attribute.
-    Uses the same lower-confidence-bound feasibility check for each constraint, computed
-    over the remaining R-1 spots after taking this neither candidate.
+    Decide whether it's safe to accept a candidate with neither attribute.
+    Uses the same lower-confidence-bound feasibility check for each constraint,
+    computed over the remaining R-1 spots after taking this neither candidate.
 
-    More permissive during early buffer (admitted < 700) if both safety margins are healthy.
+    Margin/schedule gates are removed; feasibility is enforced solely via the LCB
+    checks to avoid rejecting safe neither candidates.
     """
     R = max(0, state.N - state.admitted_count)
     if R <= 1:
@@ -224,7 +216,6 @@ def _safe_accept_neither(state) -> bool:
     if len(attrs) < 2:
         return False
 
-    safety_margins = []
     for a in attrs:
         cur = int(state.counts.get(a, 0))
         M = int(state.constraints.get(a, 0))
@@ -239,37 +230,5 @@ def _safe_accept_neither(state) -> bool:
         lcb = mu - z * (var ** 0.5)
         if (cur + lcb) < M:
             return False
-        safety_margins.append(cur + mu - M)
-
-    # Schedule-aware gating: prefer neither when both attrs are at/above their
-    # incremental target schedule.
-    k = state.admitted_count
-    N = max(1, state.N)
-    # Dynamic slack: 10 early, taper to 0 by k>=800
-    if k < 800:
-        slack = int((10 * (800 - k)) / 800)
-    else:
-        slack = 0
-    ahead_schedule_both = True
-    for a in attrs:
-        cur = int(state.counts.get(a, 0))
-        M = int(state.constraints.get(a, 0))
-        target_now = (M * k + (N - 1)) // N  # ceil(M * k / N)
-        target_now += slack
-        if cur < target_now:
-            ahead_schedule_both = False
-            break
-
-    # Both constraints feasible via LCB. Now gate permissiveness by safety margin,
-    # progress window, and schedule.
-    min_margin = min(safety_margins) if safety_margins else 0.0
-    # Early buffer period: accept neither to soak capacity and stay near 600/600
-    if state.admitted_count < 850 and min_margin >= 8:
-        return True
-    # If both ahead-of-schedule (with slack), allow neither even with smaller margin
-    if ahead_schedule_both:
-        return True
-    # If extremely safe, also allow neither regardless of phase
-    if min_margin >= 30:
-        return True
-    return False
+    # LCB-feasible for both constraints; accept the neither candidate
+    return True

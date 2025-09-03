@@ -133,39 +133,97 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     vc = person.get("vinyl_collector", False)
     need_qf = need.get("queer_friendly", 0)
     need_vc = need.get("vinyl_collector", 0)
-    if (qf and need_qf > 0) or (vc and need_vc > 0):
+
+    # Padding: treat qf/vc as under target until a small buffer above min.
+    # This pulls QF/VC earlier so we don't end up with razor-thin feasibility.
+    PAD_QF = 0.06  # 6% padding
+    PAD_VC = 0.06  # 6% padding
+    from math import ceil
+    qf_min_padded = ceil(state.constraints.get("queer_friendly", 0) * (1.0 + PAD_QF))
+    vc_min_padded = ceil(state.constraints.get("vinyl_collector", 0) * (1.0 + PAD_VC))
+    qf_under_padded = state.counts.get("queer_friendly", 0) < qf_min_padded
+    vc_under_padded = state.counts.get("vinyl_collector", 0) < vc_min_padded
+
+    # Auto-accept QF/VC while under padded minima, with endgame feasibility guard
+    if (qf and qf_under_padded) or (vc and vc_under_padded):
         if R <= 120 and not _feasible(person, state):
             return False
         return True
+    
+
+    # Overrepresentation guard for underground_veteran:
+    # If UGV is at/over min (or modestly over), only accept when they cover
+    # multiple current deficits (e.g., GS+INTL, QF+GS, etc.). This reduces
+    # UGV admits unless they strongly help remaining constraints.
+    ugv = person.get("underground_veteran", False)
+    if ugv:
+        ugv_need = need.get("underground_veteran", 0)
+        ugv_ratio = state.counts.get("underground_veteran", 0) / max(1, state.constraints.get("underground_veteran", 0))
+        if ugv_need <= 0 or ugv_ratio >= 1.05:
+            deficit_hits = 0
+            for a in ("queer_friendly", "vinyl_collector", "german_speaker", "international"):
+                if need.get(a, 0) > 0 and person.get(a, False):
+                    deficit_hits += 1
+            if deficit_hits < 2:
+                return False
+
+    # Phase 1 focus: push QF to 90% of min; keep taking VC; occasionally accept GS/INTL
+    qf_ratio_min = state.counts.get("queer_friendly", 0) / max(1, state.constraints.get("queer_friendly", 0))
+    if qf_ratio_min < 0.9:
+        if qf or vc:
+            if R <= 120 and not _feasible(person, state):
+                return False
+            return True
+        # Maintain GS/INTL around 50-60% during QF focus
+        gs_ratio_min = state.counts.get("german_speaker", 0) / max(1, state.constraints.get("german_speaker", 0))
+        intl_ratio_min = state.counts.get("international", 0) / max(1, state.constraints.get("international", 0))
+        HOLD_LOW, HOLD_HIGH = 0.50, 0.60
+        has_gs = person.get("german_speaker", False)
+        has_intl = person.get("international", False)
+
+        # Always backfill if under 50%
+        if (has_gs and gs_ratio_min < HOLD_LOW) or (has_intl and intl_ratio_min < HOLD_LOW):
+            if R <= 120 and not _feasible(person, state):
+                return False
+            return True
+
+        # Between 50-60%, only allow when the candidate hits BOTH GS and INTL
+        if has_gs and has_intl and ((gs_ratio_min < HOLD_HIGH) or (intl_ratio_min < HOLD_HIGH)):
+            if R <= 120 and not _feasible(person, state):
+                return False
+            return True
+        return False
 
     # 3) Reservation mode phases while qf/vc still below target for non-qf/vc
-    qf_under = state.counts.get("queer_friendly", 0) < state.constraints.get("queer_friendly", 0)
-    vc_under = state.counts.get("vinyl_collector", 0) < state.constraints.get("vinyl_collector", 0)
-    if (qf_under or vc_under) and not (qf or vc):
+    # Use padded-under flags for reservation/gating behavior
+    qf_under = qf_under_padded
+    vc_under = vc_under_padded
+    if qf_ratio_min < 0.9 and (qf_under or vc_under) and not (qf or vc):
         # Compute fill ratios for qf/vc relative to their minima
         def _ratio(attr: str) -> float:
-            M = max(1, state.constraints.get(attr, 0))
+            if attr == "queer_friendly":
+                M = max(1, qf_min_padded)
+            elif attr == "vinyl_collector":
+                M = max(1, vc_min_padded)
+            else:
+                M = max(1, state.constraints.get(attr, 0))
             return state.counts.get(attr, 0) / M
 
         qf_ratio = _ratio("queer_friendly")
         vc_ratio = _ratio("vinyl_collector")
         focus_ratio = min(qf_ratio, vc_ratio)
-        # Stage 1: if focus_ratio < 0.5, only allow non-qf/vc if they have
-        # BOTH german_speaker AND international (very selective early)
+        # Stage 1: if focus_ratio < 0.5, be extremely selective:
+        # - Flat reject UGV/FF here unless they are also QF/VC (they aren't in this branch)
+        # - For everyone else, require BOTH german_speaker AND international
         if focus_ratio < 0.5:
             # Be stricter with underground_veteran; modestly stricter with fashion_forward.
             gs_ok = person.get("german_speaker", False)
             intl_ok = person.get("international", False)
             ugv = person.get("underground_veteran", False)
             ff = person.get("fashion_forward", False)
-            if ugv:
-                # Require BOTH gs and intl to admit an underground veteran here
-                if not (gs_ok and intl_ok):
-                    return False
-            elif ff:
-                # Require at least one of gs or intl for fashion_forward here
-                if not (gs_ok or intl_ok):
-                    return False
+            # Hard block overrepresented tracks early to reserve slots
+            if ugv or ff:
+                return False
             # General gate for all other non-qf/vc
             if not (gs_ok and intl_ok):
                 return False
@@ -247,7 +305,7 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     }
     dampen = {
         # Stronger dampening on underground_veteran so they contribute less to score
-        "underground_veteran": 0.35,
+        "underground_veteran": 0.3,
         # Softer dampening on fashion_forward
         "fashion_forward": 0.5,
     }
@@ -265,7 +323,7 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     # Additional negative bias: if ugv/ff are already at or above min, penalize
     # to reduce their acceptance when they don't help deficits.
     if person.get("underground_veteran", False) and need.get("underground_veteran", 0) <= 0:
-        s -= 0.6
+        s -= 0.8
     if person.get("fashion_forward", False) and need.get("fashion_forward", 0) <= 0:
         s -= 0.25
 
@@ -298,12 +356,30 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     except Exception:
         pass
 
-    # Make threshold a bit stricter for ugv/ff when they don't help deficits
+    # Make threshold stricter for ugv/ff when they don't help deficits.
+    # When QF/VC are < 50% padded target, be even stricter to leave room.
     if (person.get("underground_veteran", False) or person.get("fashion_forward", False)) and not (
         (qf and need_qf > 0) or (vc and need_vc > 0) or any(
             person.get(a, False) and need.get(a, 0) > 0 for a in ("german_speaker", "international")
         )
     ):
-        threshold *= 1.1
+        # Recompute padded focus ratio (reuse above if available)
+        try:
+            qf_ratio_p = state.counts.get("queer_friendly", 0) / max(1, qf_min_padded)
+            vc_ratio_p = state.counts.get("vinyl_collector", 0) / max(1, vc_min_padded)
+            if min(qf_ratio_p, vc_ratio_p) < 0.5:
+                threshold *= 1.25
+            else:
+                # If UGV already over min, tighten further
+                if person.get("underground_veteran", False):
+                    ugv_ratio_cur = state.counts.get("underground_veteran", 0) / max(1, state.constraints.get("underground_veteran", 0))
+                    if ugv_ratio_cur >= 1.05:
+                        threshold *= 1.2
+                    else:
+                        threshold *= 1.1
+                else:
+                    threshold *= 1.1
+        except Exception:
+            threshold *= 1.1
 
     return s >= threshold
