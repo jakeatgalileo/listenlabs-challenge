@@ -27,8 +27,10 @@ UNION_MARGIN_FRAC = 0.10      # slack fraction for B∧T union feasibility
 UNION_MARGIN_MIN = 8
 CREATIVE_AUTO_RATIO = 0.95    # auto-accept creatives until 95% of min
 B_STRUGGLE_RATIO = 0.95       # treat B as struggling until 95%
-T_STRUGGLE_RATIO = 0.90       # techno_lover struggling threshold
+T_STRUGGLE_RATIO = 0.93       # slightly higher to accept more T
 W_STRUGGLE_RATIO = 0.85       # well_connected struggling threshold (lower: de-emphasize W)
+SINGLE_ACCEPT_SLACK = 0.05    # 5% slack on feasibility for single-attr B/T admits
+W_DEFER_REMAINING = 120       # ignore W-only until this many seats remain
 
 
 def _remaining(state) -> int:
@@ -127,12 +129,17 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
         return bool(has_B and has_T)
 
     overlap_req = _overlap_needed(need, R)
-    if has_B and has_T and overlap_req > 0:
+    if has_B and has_T and (overlap_req > 0 or (U < union_margin and (ratioB < 1.0 or ratioT < 1.0))):
         return True
 
-    # Reject W-only candidates outright (do not let W inflate counts)
+    # Defer W-only admissions until late; accept near end only if W still needed and feasible
     if has_W and (not has_B) and (not has_T) and (not person.get(A_C, False)):
-        return False
+        if R > W_DEFER_REMAINING:
+            return False
+        else:
+            if need_W > 0 and _endgame_feasible(person, state):
+                return True
+            return False
 
     # 4) Single-attribute admits only if the other remains feasible
     pB = max(0.0, state.freqs.get(A_B, 0.0))
@@ -140,13 +147,17 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
 
     if has_B and not has_T and need_B > 0:
         # If T is already safe or fulfilled, lean into B
-        if ratioT >= 1.0 and U < union_margin:
+        if ratioT >= 0.95 and U < union_margin:
             return True
-        if (R - 1) * pT >= need_T and U < 0:
+        # Allow slight slack on T feasibility to keep B moving
+        if ((R - 1) * pT) >= (need_T * (1.0 - SINGLE_ACCEPT_SLACK)) and U <= 0:
             return True
 
     if has_T and not has_B and need_T > 0:
-        if (R - 1) * pB >= need_B and U < 0:
+        # If B is already safe or fulfilled, lean into T
+        if ratioB >= 0.95 and U < union_margin:
+            return True
+        if ((R - 1) * pB) >= (need_B * (1.0 - SINGLE_ACCEPT_SLACK)) and U <= 0:
             return True
 
     # (Removed) C-only avoidance and creative reservation – creatives are always accepted above
@@ -180,7 +191,7 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
             return True
         # Note: Do not auto-accept W on struggle; it fills naturally.
 
-    # 6) Scoring fallback with scarcity and synergy (B weighted highest)
+    # 6) Scoring fallback with scarcity and synergy (B and T weighted higher)
     scarcity: Dict[str, float] = {}
     for a in state.constraints:
         p = max(1e-6, state.freqs.get(a, 0.0))
@@ -189,20 +200,20 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     s = 0.0
     # B weighted highest, then T, then W. C is auto-accepted above.
     if has_B:
-        s += 1.6 * (1.0 + 2.4 * scarcity.get(A_B, 0.0))
+        s += 1.8 * (1.0 + 2.6 * scarcity.get(A_B, 0.0))
     else:
         if need_B > 0:
             s -= 0.7 * (1.0 + 1.3 * scarcity.get(A_B, 0.0))
     if has_T:
-        s += 0.7 * (1.0 + 1.0 * scarcity.get(A_T, 0.0))
+        s += 1.0 * (1.0 + 1.4 * scarcity.get(A_T, 0.0))
     else:
         if need_T > 0:
             s -= 0.35 * (1.0 + 1.0 * scarcity.get(A_T, 0.0))
-    # W does not contribute positive score; only slight penalty if needed
+    # W does not contribute positive score; apply need penalty only late
     if has_W:
         s += 0.0
     else:
-        if need_W > 0:
+        if need_W > 0 and R <= W_DEFER_REMAINING:
             s -= 0.10 * (1.0 + 0.3 * scarcity.get(A_W, 0.0))
     # Penalize W-only slightly when W is already met
     if has_W and (not has_B) and (not has_T) and ratioW >= 1.0:
@@ -210,7 +221,7 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
 
     # Explicit synergy bonus when both B and T present
     if has_B and has_T:
-        s += 2.0
+        s += 2.3
 
     # Light correlation bonus toward unmet, scarcity-weighted needs
     for a_true, v in person.items():

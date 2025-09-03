@@ -177,24 +177,32 @@ def _safe_wrong_side_accept(unmet_attr: str, state) -> bool:
         rem_frac = max(0.0, min(1.0, (state.N - state.admitted_count) / state.N))
     z = 0.3 + 0.5 * rem_frac
     lcb = mu - z * (var ** 0.5)
-    # Base check via LCB
-    if (cur + lcb) >= M:
-        return True
-
-    # Early buffer period: be a bit more willing in Phase B
-    # If we still have a comfortable expected surplus, accept wrong-side.
-    # Safety margin = current + expected_future - target
-    safety_margin = cur + mu - M
-    if state.admitted_count < 700 and safety_margin >= 15:
-        return True
-
-    # Optional: if margin is very healthy, relax even more
-    if safety_margin >= 30:
-        return True
-
-    # If margin is tight, stay conservative
-    if safety_margin <= 10:
+    # Require feasibility via LCB (necessary condition)
+    if (cur + lcb) < M:
         return False
+
+    # Schedule gate: only allow wrong-side acceptance when the unmet attribute
+    # is at/above its time-proportional schedule (with slack).
+    k = state.admitted_count
+    N = max(1, state.N)
+    # Dynamic slack: 10 early, taper to 0 by k>=800
+    if k < 800:
+        slack = int((10 * (800 - k)) / 800)
+    else:
+        slack = 0
+    target_now = (M * k + (N - 1)) // N  # ceil(M * k / N)
+    target_now += slack
+    if cur < target_now:
+        return False
+
+    # Early buffer period: allow wrong-side only with stronger margins
+    safety_margin = cur + mu - M
+    if state.admitted_count < 800 and safety_margin >= 20:
+        return True
+
+    # Always allow with very large margins
+    if safety_margin >= 40:
+        return True
 
     return False
 

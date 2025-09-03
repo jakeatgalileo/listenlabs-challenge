@@ -153,7 +153,21 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
         # Stage 1: if focus_ratio < 0.5, only allow non-qf/vc if they have
         # BOTH german_speaker AND international (very selective early)
         if focus_ratio < 0.5:
-            if not (person.get("german_speaker", False) and person.get("international", False)):
+            # Be stricter with underground_veteran; modestly stricter with fashion_forward.
+            gs_ok = person.get("german_speaker", False)
+            intl_ok = person.get("international", False)
+            ugv = person.get("underground_veteran", False)
+            ff = person.get("fashion_forward", False)
+            if ugv:
+                # Require BOTH gs and intl to admit an underground veteran here
+                if not (gs_ok and intl_ok):
+                    return False
+            elif ff:
+                # Require at least one of gs or intl for fashion_forward here
+                if not (gs_ok or intl_ok):
+                    return False
+            # General gate for all other non-qf/vc
+            if not (gs_ok and intl_ok):
                 return False
         # Stage 2: if 0.5 <= focus_ratio < 0.9, allow non-qf/vc only if they
         # help any attribute that is < 90% of its minimum
@@ -164,6 +178,10 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
             ]
             if not any(person.get(a, False) for a in underfilled_90):
                 return False
+            # If candidate is underground_veteran but doesn't help hard ones, reject
+            if person.get("underground_veteran", False):
+                if not (person.get("german_speaker", False) or person.get("international", False)):
+                    return False
         # Stage 3: focus_ratio >= 0.9, fall through to normal scoring
 
     # 4) Scarcity-aware early accept: take highly scarce contributors
@@ -224,12 +242,14 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     boost = {
         "queer_friendly": 2.0,
         "vinyl_collector": 2.0,
-        "german_speaker": 1.2,
-        "international": 1.1,
+        "german_speaker": 1.25,
+        "international": 1.15,
     }
     dampen = {
-        "underground_veteran": 0.6,
-        "fashion_forward": 0.6,
+        # Stronger dampening on underground_veteran so they contribute less to score
+        "underground_veteran": 0.35,
+        # Softer dampening on fashion_forward
+        "fashion_forward": 0.5,
     }
 
     # Direct contribution and opportunity penalty
@@ -241,6 +261,13 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
         else:
             if need[a] > 0:
                 s -= 0.6 * Wa * (1.0 + 0.7 * Sa)
+
+    # Additional negative bias: if ugv/ff are already at or above min, penalize
+    # to reduce their acceptance when they don't help deficits.
+    if person.get("underground_veteran", False) and need.get("underground_veteran", 0) <= 0:
+        s -= 0.6
+    if person.get("fashion_forward", False) and need.get("fashion_forward", 0) <= 0:
+        s -= 0.25
 
     # Correlation-aware bonus toward needed, scarce targets
     for at, v in person.items():
@@ -270,5 +297,13 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
         threshold *= (1.0 - min(0.2, 0.05 * max_s))
     except Exception:
         pass
+
+    # Make threshold a bit stricter for ugv/ff when they don't help deficits
+    if (person.get("underground_veteran", False) or person.get("fashion_forward", False)) and not (
+        (qf and need_qf > 0) or (vc and need_vc > 0) or any(
+            person.get(a, False) and need.get(a, 0) > 0 for a in ("german_speaker", "international")
+        )
+    ):
+        threshold *= 1.1
 
     return s >= threshold
