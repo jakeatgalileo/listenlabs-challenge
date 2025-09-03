@@ -110,6 +110,14 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     has_T = bool(person.get(A_T, False))
     has_W = bool(person.get(A_W, False))
 
+    # Current fulfillment ratios
+    minB = max(1, int(state.constraints.get(A_B, 1)))
+    minT = max(1, int(state.constraints.get(A_T, 1)))
+    minW = max(1, int(state.constraints.get(A_W, 1)))
+    ratioB = (state.counts.get(A_B, 0) / minB)
+    ratioT = (state.counts.get(A_T, 0) / minT)
+    ratioW = (state.counts.get(A_W, 0) / minW)
+
     # Union feasibility metric U = (need_B + need_T - R)
     U = (need_B + need_T) - R
     union_margin = max(UNION_MARGIN_MIN, int(UNION_MARGIN_FRAC * R))
@@ -122,11 +130,18 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     if has_B and has_T and overlap_req > 0:
         return True
 
+    # Reject W-only candidates outright (do not let W inflate counts)
+    if has_W and (not has_B) and (not has_T) and (not person.get(A_C, False)):
+        return False
+
     # 4) Single-attribute admits only if the other remains feasible
     pB = max(0.0, state.freqs.get(A_B, 0.0))
     pT = max(0.0, state.freqs.get(A_T, 0.0))
 
     if has_B and not has_T and need_B > 0:
+        # If T is already safe or fulfilled, lean into B
+        if ratioT >= 1.0 and U < union_margin:
+            return True
         if (R - 1) * pT >= need_T and U < 0:
             return True
 
@@ -134,7 +149,7 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
         if (R - 1) * pB >= need_B and U < 0:
             return True
 
-    # 5) (Removed) C-only avoidance and creative reservation – creatives are always accepted above
+    # (Removed) C-only avoidance and creative reservation – creatives are always accepted above
 
     # 6.5) Auto-accept struggling attributes until 90% (with guards)
     ratios: Dict[str, float] = {a: (state.counts.get(a, 0) / max(1, state.constraints.get(a, 1))) for a in state.constraints}
@@ -183,11 +198,15 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     else:
         if need_T > 0:
             s -= 0.35 * (1.0 + 1.0 * scarcity.get(A_T, 0.0))
+    # W does not contribute positive score; only slight penalty if needed
     if has_W:
-        s += 0.2 * (1.0 + 0.3 * scarcity.get(A_W, 0.0))
+        s += 0.0
     else:
         if need_W > 0:
             s -= 0.10 * (1.0 + 0.3 * scarcity.get(A_W, 0.0))
+    # Penalize W-only slightly when W is already met
+    if has_W and (not has_B) and (not has_T) and ratioW >= 1.0:
+        s -= 0.4
 
     # Explicit synergy bonus when both B and T present
     if has_B and has_T:

@@ -233,10 +233,33 @@ def _safe_accept_neither(state) -> bool:
             return False
         safety_margins.append(cur + mu - M)
 
-    # Both constraints feasible via LCB. Now gate permissiveness by safety margin and phase.
+    # Schedule-aware gating: prefer neither when both attrs are at/above their
+    # incremental target schedule.
+    k = state.admitted_count
+    N = max(1, state.N)
+    # Dynamic slack: 10 early, taper to 0 by k>=800
+    if k < 800:
+        slack = int((10 * (800 - k)) / 800)
+    else:
+        slack = 0
+    ahead_schedule_both = True
+    for a in attrs:
+        cur = int(state.counts.get(a, 0))
+        M = int(state.constraints.get(a, 0))
+        target_now = (M * k + (N - 1)) // N  # ceil(M * k / N)
+        target_now += slack
+        if cur < target_now:
+            ahead_schedule_both = False
+            break
+
+    # Both constraints feasible via LCB. Now gate permissiveness by safety margin,
+    # progress window, and schedule.
     min_margin = min(safety_margins) if safety_margins else 0.0
     # Early buffer period: accept neither to soak capacity and stay near 600/600
-    if state.admitted_count < 700 and min_margin >= 15:
+    if state.admitted_count < 850 and min_margin >= 8:
+        return True
+    # If both ahead-of-schedule (with slack), allow neither even with smaller margin
+    if ahead_schedule_both:
         return True
     # If extremely safe, also allow neither regardless of phase
     if min_margin >= 30:
