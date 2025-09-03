@@ -2,13 +2,11 @@ from typing import Dict, List
 
 
 """
-Scenario 2: Creative-first with feasibility guards.
+Scenario 2: Creative-first with B emphasis.
 
 Implements:
 - Hard safety to avoid infeasibility.
-- Creative reservation: reject non-creative when remaining capacity cannot safely
-  cover remaining creative need.
-- Priority ordering: accept creative; then accept B∧T when required overlap is
+- Priority ordering: accept creative (always); then accept B∧T when required overlap is
   positive; accept single B/T only if the other remains feasible.
 - Moderate endgame guard at R ≤ 80 using a conservative feasibility check.
 - Scoring fallback: scarcity-weighted with explicit B∧T synergy and light
@@ -28,6 +26,9 @@ SCARCITY_CLIP = 5.0
 UNION_MARGIN_FRAC = 0.10      # slack fraction for B∧T union feasibility
 UNION_MARGIN_MIN = 8
 CREATIVE_AUTO_RATIO = 0.95    # auto-accept creatives until 95% of min
+B_STRUGGLE_RATIO = 0.95       # treat B as struggling until 95%
+T_STRUGGLE_RATIO = 0.90       # techno_lover struggling threshold
+W_STRUGGLE_RATIO = 0.85       # well_connected struggling threshold (lower: de-emphasize W)
 
 
 def _remaining(state) -> int:
@@ -128,32 +129,25 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     if has_B and not has_T and need_B > 0:
         if (R - 1) * pT >= need_T and U < 0:
             return True
-        if (
-            U < 0
-            and need_W > 0
-            and has_W
-            and (R - 1) * pT >= need_T
-            and (R - 1) * pB >= need_B
-        ):
-            return True
 
     if has_T and not has_B and need_T > 0:
         if (R - 1) * pB >= need_B and U < 0:
-            return True
-        if (
-            U < 0
-            and need_W > 0
-            and has_W
-            and (R - 1) * pT >= need_T
-            and (R - 1) * pB >= need_B
-        ):
             return True
 
     # 5) (Removed) C-only avoidance and creative reservation – creatives are always accepted above
 
     # 6.5) Auto-accept struggling attributes until 90% (with guards)
     ratios: Dict[str, float] = {a: (state.counts.get(a, 0) / max(1, state.constraints.get(a, 1))) for a in state.constraints}
-    struggling = {a for a in state.constraints if ratios[a] < 0.90}
+    struggling = set()
+    for a in state.constraints:
+        if a == A_B:
+            thr = B_STRUGGLE_RATIO
+        elif a == A_T:
+            thr = T_STRUGGLE_RATIO
+        else:
+            thr = W_STRUGGLE_RATIO  # A_W
+        if ratios[a] < thr:
+            struggling.add(a)
     if U < union_margin and struggling:
         # Priority: C, then B/T (respect other-attr feasibility), then W
         if person.get(A_C, False) and A_C in struggling:
@@ -169,9 +163,7 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
         # B∧T always helps when struggling and not union-critical
         if (A_B in struggling or A_T in struggling) and has_B and has_T:
             return True
-        # W when struggling and not union-critical
-        if (A_W in struggling) and has_W:
-            return True
+        # Note: Do not auto-accept W on struggle; it fills naturally.
 
     # 6) Scoring fallback with scarcity and synergy (B weighted highest)
     scarcity: Dict[str, float] = {}
@@ -182,24 +174,24 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     s = 0.0
     # B weighted highest, then T, then W. C is auto-accepted above.
     if has_B:
-        s += 1.2 * (1.0 + 2.2 * scarcity.get(A_B, 0.0))
+        s += 1.6 * (1.0 + 2.4 * scarcity.get(A_B, 0.0))
     else:
         if need_B > 0:
-            s -= 0.6 * (1.0 + 1.2 * scarcity.get(A_B, 0.0))
+            s -= 0.7 * (1.0 + 1.3 * scarcity.get(A_B, 0.0))
     if has_T:
-        s += 0.8 * (1.0 + 1.1 * scarcity.get(A_T, 0.0))
+        s += 0.7 * (1.0 + 1.0 * scarcity.get(A_T, 0.0))
     else:
         if need_T > 0:
-            s -= 0.4 * (1.0 + 1.0 * scarcity.get(A_T, 0.0))
+            s -= 0.35 * (1.0 + 1.0 * scarcity.get(A_T, 0.0))
     if has_W:
-        s += 0.5 * (1.0 + 0.6 * scarcity.get(A_W, 0.0))
+        s += 0.2 * (1.0 + 0.3 * scarcity.get(A_W, 0.0))
     else:
         if need_W > 0:
-            s -= 0.2 * (1.0 + 0.6 * scarcity.get(A_W, 0.0))
+            s -= 0.10 * (1.0 + 0.3 * scarcity.get(A_W, 0.0))
 
     # Explicit synergy bonus when both B and T present
     if has_B and has_T:
-        s += 1.5
+        s += 2.0
 
     # Light correlation bonus toward unmet, scarcity-weighted needs
     for a_true, v in person.items():

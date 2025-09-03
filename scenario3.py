@@ -138,17 +138,50 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
             return False
         return True
 
-    # 3) Scarcity-aware early accept: take highly scarce contributors
-    general_criticality = 0.7
-    scarce_hits = [
-        scarcity[a]
-        for a in state.constraints
-        if person.get(a, False) and need[a] > 0
-    ]
-    if scarce_hits and max(scarce_hits) >= general_criticality:
-        return True
+    # 3) Reservation mode phases while qf/vc still below target for non-qf/vc
+    qf_under = state.counts.get("queer_friendly", 0) < state.constraints.get("queer_friendly", 0)
+    vc_under = state.counts.get("vinyl_collector", 0) < state.constraints.get("vinyl_collector", 0)
+    if (qf_under or vc_under) and not (qf or vc):
+        # Compute fill ratios for qf/vc relative to their minima
+        def _ratio(attr: str) -> float:
+            M = max(1, state.constraints.get(attr, 0))
+            return state.counts.get(attr, 0) / M
 
-    # 4) High-value correlation rules (qf-vc-gs synergy)
+        qf_ratio = _ratio("queer_friendly")
+        vc_ratio = _ratio("vinyl_collector")
+        focus_ratio = min(qf_ratio, vc_ratio)
+        # Stage 1: if focus_ratio < 0.5, only allow non-qf/vc if they have
+        # BOTH german_speaker AND international (very selective early)
+        if focus_ratio < 0.5:
+            if not (person.get("german_speaker", False) and person.get("international", False)):
+                return False
+        # Stage 2: if 0.5 <= focus_ratio < 0.9, allow non-qf/vc only if they
+        # help any attribute that is < 90% of its minimum
+        elif focus_ratio < 0.9:
+            underfilled_90 = [
+                a for a, M in state.constraints.items()
+                if M > 0 and state.counts.get(a, 0) < 0.9 * M
+            ]
+            if not any(person.get(a, False) for a in underfilled_90):
+                return False
+        # Stage 3: focus_ratio >= 0.9, fall through to normal scoring
+
+    # 4) Scarcity-aware early accept: take highly scarce contributors
+    # But when focus is strongly on qf/vc (<0.5), skip non-qf/vc here
+    general_criticality = 0.7
+    if not ((qf_under or vc_under) and not (qf or vc) and (min(
+        state.counts.get("queer_friendly", 0) / max(1, state.constraints.get("queer_friendly", 0)),
+        state.counts.get("vinyl_collector", 0) / max(1, state.constraints.get("vinyl_collector", 0)),
+    ) < 0.5)):
+        scarce_hits = [
+            scarcity[a]
+            for a in state.constraints
+            if person.get(a, False) and need[a] > 0
+        ]
+        if scarce_hits and max(scarce_hits) >= general_criticality:
+            return True
+
+    # 5) High-value correlation rules (qf-vc-gs synergy)
     gs = person.get("german_speaker", False)
 
     # Accept qf+vc combo if either is still needed (leverages 0.48 correlation)
@@ -168,7 +201,7 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     ):
         return True
 
-    # Prioritized deficit-first for the hard attributes (<100%)
+    # 6) Prioritized deficit-first for the hard attributes (<100%)
     # Keep a slightly stricter gate: only prioritize if < 90% filled or scarce
     for a in ("queer_friendly", "vinyl_collector", "german_speaker", "international"):
         M = state.constraints.get(a, 0)
@@ -176,18 +209,6 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
         if person.get(a, False) and M > 0:
             if (c < 0.9 * M) or (scarcity.get(a, 0.0) >= 0.7):
                 return True
-
-    # 4b) Reservation mode: when qf or vc are under minimum, only accept
-    # non-qf/vc candidates if they help an underfilled attribute
-    qf_under = state.counts.get("queer_friendly", 0) < state.constraints.get("queer_friendly", 0)
-    vc_under = state.counts.get("vinyl_collector", 0) < state.constraints.get("vinyl_collector", 0)
-    if (qf_under or vc_under) and not (qf or vc):
-        underfilled = [
-            a for a, M in state.constraints.items()
-            if M > 0 and state.counts.get(a, 0) < M
-        ]
-        if not any(person.get(a, False) for a in underfilled):
-            return False
 
     # 5) Endgame: conservative feasibility + EV
     if R <= 120:
@@ -201,14 +222,14 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
 
     # Optional per-attribute weight boost/dampen to emphasize uncommon ones
     boost = {
-        "queer_friendly": 1.8,
-        "vinyl_collector": 1.8,
+        "queer_friendly": 2.0,
+        "vinyl_collector": 2.0,
         "german_speaker": 1.2,
         "international": 1.1,
     }
     dampen = {
-        "underground_veteran": 0.9,
-        "fashion_forward": 0.9,
+        "underground_veteran": 0.6,
+        "fashion_forward": 0.6,
     }
 
     # Direct contribution and opportunity penalty
