@@ -50,4 +50,4 @@ python bouncer.py \
 - Customizing: Tweak per-scenario heuristics directly in those files. The CLI continues to manage networking and passes minimal state to each strategy.
 
 Environment knobs:
-  (none specific to Scenario 1 at this time)
+(none specific to Scenario 1 at this time)

@@ -128,10 +128,15 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     need = _need_map(state)
     scarcity = _scarcity_map(state)
 
-    # 3) Deficit-first: greedily accept contributors to unmet constraints
-    for a in state.constraints:
-        if need[a] > 0 and person.get(a, False):
-            return True
+    # 3) Scarcity-aware early accept: take highly scarce contributors
+    general_criticality = 0.7
+    scarce_hits = [
+        scarcity[a]
+        for a in state.constraints
+        if person.get(a, False) and need[a] > 0
+    ]
+    if scarce_hits and max(scarce_hits) >= general_criticality:
+        return True
 
     # 4) High-value correlation rules (qf-vc-gs synergy)
     qf = person.get("queer_friendly", False)
@@ -153,6 +158,11 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     ):
         return True
 
+    # Prioritized deficit-first for the hard attributes
+    for a in ("queer_friendly", "vinyl_collector", "german_speaker", "international"):
+        if need.get(a, 0) > 0 and person.get(a, False):
+            return True
+
     # 5) Endgame: conservative feasibility + EV
     if R <= 120:
         if not _feasible(person, state):
@@ -163,15 +173,27 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     W = _weights_required_over_base(state)
     s = 0.0
 
+    # Optional per-attribute weight boost/dampen to emphasize uncommon ones
+    boost = {
+        "queer_friendly": 1.8,
+        "vinyl_collector": 1.8,
+        "german_speaker": 1.2,
+        "international": 1.1,
+    }
+    dampen = {
+        "underground_veteran": 0.9,
+        "fashion_forward": 0.9,
+    }
+
     # Direct contribution and opportunity penalty
     for a in state.constraints:
         Sa = scarcity[a]
-        Wa = W[a]
-        if person.get(a, False):
-            s += 1.0 * Wa * (1.0 + 0.8 * Sa)
+        Wa = W[a] * boost.get(a, 1.0) * dampen.get(a, 1.0)
+        if person.get(a, False) and need[a] > 0:
+            s += 1.0 * Wa * (1.0 + 0.85 * Sa)
         else:
             if need[a] > 0:
-                s -= 0.5 * Wa * (1.0 + 0.6 * Sa)
+                s -= 0.6 * Wa * (1.0 + 0.7 * Sa)
 
     # Correlation-aware bonus toward needed, scarce targets
     for at, v in person.items():
@@ -184,14 +206,14 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
             if c <= 0:
                 continue
             Sa = scarcity[an]
-            Wa = W[an]
-            s += 0.3 * c * Wa * (1.0 + 0.8 * Sa)
+            Wa = W[an] * boost.get(an, 1.0)
+            s += 0.5 * c * Wa * (1.0 + 0.9 * Sa)
 
     # 7) Adaptive threshold with recent rejection rate and pressure
     threshold = _adaptive_threshold(
         state,
         rejection_history,
-        base_start=0.7,
+        base_start=0.6,
         window=min(100, max(10, state.total_seen if hasattr(state, "total_seen") else 100)),
     )
 
