@@ -12,6 +12,7 @@ Implements:
 - Scoring fallback: scarcity-weighted with explicit B∧T synergy and light
   correlation bonus; adaptive threshold from recent rejection rate and deficits.
  - Strict W gating: reject W unless paired with B or C (i.e., reject W-only and W+T-only).
+ - Creatives: auto-accept only until 95% of min; after that, treat as normal unless they also carry B/T.
 """
 
 # Attribute ids used by the API
@@ -25,6 +26,7 @@ ENDGAME_REMAINING = 80        # conservative finishing window
 SCARCITY_CLIP = 5.0
 UNION_MARGIN_FRAC = 0.10      # slack fraction for B∧T union feasibility
 UNION_MARGIN_MIN = 8
+BONUS_CREATIVE_AUTO_RATIO = 0.95  # auto-accept creatives until 95% of min
 B_STRUGGLE_RATIO = 0.95       # treat B as struggling until 95%
 T_STRUGGLE_RATIO = 0.93       # slightly higher to accept more T
 SINGLE_ACCEPT_SLACK = 0.05    # 5% slack on feasibility for single-attr B/T admits
@@ -94,10 +96,14 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
 
     R = _remaining(state)
     need = _need_map(state)
+    # Track creative progress for gating and correlation handling
+    minC = max(1, int(state.constraints.get(A_C, 1)))
+    ratioC = state.counts.get(A_C, 0) / minC
 
-    # 2) Unconditional creative acceptance (per strategy preference)
+    # 2) Creatives: auto-accept only until 95% of min
     if person.get(A_C, False):
-        return True
+        if ratioC < BONUS_CREATIVE_AUTO_RATIO:
+            return True
 
     # 2.5) Strict W gating per strategy: only accept W when paired with B or C
     has_B = bool(person.get(A_B, False))
@@ -106,9 +112,9 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     if has_W and not (has_B or person.get(A_C, False)):
         return False
 
-    # 3) Moderate endgame guard
-    if R <= ENDGAME_REMAINING:
-        return _endgame_feasible(person, state)
+    # 3) Moderate endgame guard (reject only if infeasible)
+    if R <= ENDGAME_REMAINING and not _endgame_feasible(person, state):
+        return False
 
     # 3) Reconcile B vs T via overlap priority and union control
     need_B = need.get(A_B, 0)
@@ -207,6 +213,9 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     # Light correlation bonus toward unmet, scarcity-weighted needs
     for a_true, v in person.items():
         if not v:
+            continue
+        # After creatives reach 95%, ignore correlation credit from C to avoid over-accepting C-only
+        if a_true == A_C and ratioC >= BONUS_CREATIVE_AUTO_RATIO:
             continue
         # Only consider correlation toward unmet B/T
         for a_need in (A_B, A_T):

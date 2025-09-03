@@ -143,7 +143,13 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     qf_under_padded = state.counts.get("queer_friendly", 0) < qf_min_padded
     vc_under_padded = state.counts.get("vinyl_collector", 0) < vc_min_padded
 
-    # Auto-accept QF while under its minimum (not padded). Avoid auto-accepting VC during QF focus.
+    # Unconditional preference: accept all vinyl_collectors we see (feasibility-guarded late).
+    if vc:
+        if R <= 120 and not _feasible(person, state):
+            return False
+        return True
+
+    # Auto-accept QF while under its minimum (not padded).
     if qf and (state.counts.get("queer_friendly", 0) < state.constraints.get("queer_friendly", 0)):
         if R <= 120 and not _feasible(person, state):
             return False
@@ -173,30 +179,16 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
             if R <= 120 and not _feasible(person, state):
                 return False
             return True
-        # General guidance: accept some GS/INTL along the way
-        # - If moderately low (<60%), accept
-        # - If candidate has BOTH GS and INTL, allow an occasional trickle: every 16th admit
+        # General guidance: accept a few GS/INTL along the way (very sparingly)
+        # - Only allow BOTH GS and INTL together on an occasional trickle
         gs_ratio_min = state.counts.get("german_speaker", 0) / max(1, state.constraints.get("german_speaker", 0))
         intl_ratio_min = state.counts.get("international", 0) / max(1, state.constraints.get("international", 0))
         has_gs = person.get("german_speaker", False)
         has_intl = person.get("international", False)
-        GS_LOW = 0.68
-        INTL_LOW = 0.60
-        TRICKLE = 16
+        TRICKLE_COMBO = 30
         if need.get("german_speaker", 0) > 0 or need.get("international", 0) > 0:
-            # Single-attribute backfill when moderately low
-            if (has_gs and gs_ratio_min < GS_LOW) or (has_intl and intl_ratio_min < INTL_LOW):
-                if R <= 120 and not _feasible(person, state):
-                    return False
-                return True
-            # Occasional high-utility combo
-            if has_gs and has_intl and (state.admitted_count % TRICKLE == 0):
-                if R <= 120 and not _feasible(person, state):
-                    return False
-                return True
-            # Occasional GS-only trickle when still needed
-            GS_TRICKLE = 20
-            if has_gs and (state.admitted_count % GS_TRICKLE == 0):
+            # Occasional high-utility combo only
+            if has_gs and has_intl and (state.admitted_count % TRICKLE_COMBO == 0):
                 if R <= 120 and not _feasible(person, state):
                     return False
                 return True
