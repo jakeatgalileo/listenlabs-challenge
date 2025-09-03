@@ -41,3 +41,10 @@ python bouncer.py \
 - Constraint scoring: weighs how each person helps unmet minimums.
 - Endgame feasibility: avoids choices that could make constraints impossible.
 - Scarcity-weighted prioritization: prioritizes rare-but-required attributes using a per-attribute scarcity S[a] = need[a] / (R \* p[a]) with clipping. Direct help, missing penalties, and correlation bonuses are scaled by scarcity, and an early accept triggers if a candidate contributes to highly scarce requirements. Tune via scenario configs or `--scarcity-mult`.
+
+## Scenario-specific strategies
+
+- Files: `scenario1.py`, `scenario2.py`, `scenario3.py` implement per-scenario decision functions.
+- Selection: `bouncer.py` dynamically imports `scenario{scenario}.py` and calls its `decide(...)`.
+- Independence: These modules are self-contained (no imports from `bouncer.py`). Each implements its own heuristics and feasibility checks.
+- Customizing: Tweak per-scenario heuristics directly in those files. The CLI continues to manage networking and passes minimal state to each strategy.

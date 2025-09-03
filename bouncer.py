@@ -8,6 +8,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import os
 import json
+import importlib
 
 """
 Core Strategy Highlights:
@@ -785,13 +786,27 @@ def main():
         # Blend frequencies online (lightweight)
         update_adaptive_freqs(state, k0=DEFAULT_K0)
 
-        # Enhanced decision algorithm
-        accept = decide_enhanced(
-            attrs,
-            state,
-            scenario=args.scenario,
-            rejection_history=rejection_history,
-        )
+        # Select per-scenario strategy (module: scenario1/2/3 with function `decide`)
+        if state.total_seen == 1:
+            # Lazily resolve strategy once per run
+            try:
+                strategy_module = importlib.import_module(f"scenario{args.scenario}")
+                strategy_decide = getattr(strategy_module, "decide")
+            except Exception:
+                # Fallback to built-in enhanced strategy
+                def strategy_decide(p, s, rh):
+                    return decide_enhanced(p, s, scenario=args.scenario, rejection_history=rh)
+            _strategy_decide = strategy_decide  # capture for closure
+        else:
+            # Use previously resolved function if present, else fallback
+            try:
+                _strategy_decide  # type: ignore[name-defined]
+            except NameError:
+                def _strategy_decide(p, s, rh):
+                    return decide_enhanced(p, s, scenario=args.scenario, rejection_history=rh)
+
+        # Make decision using selected strategy
+        accept = _strategy_decide(attrs, state, rejection_history)
 
         res = decide_and_next(args.base_url, game_id, idx, accept)
         if accept:
