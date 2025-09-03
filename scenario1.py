@@ -1,4 +1,8 @@
 from typing import Dict, List
+from collections import deque
+
+# Track last accepted candidates' attributes for empirical frequency estimates
+_ACCEPTED_WINDOW = deque(maxlen=100)
 
 
 # Greedy approach
@@ -45,50 +49,95 @@ def _must_accept_or_reject_by_feasibility(person: Dict[str, bool], state) -> Dic
     return {}
 
 
+def _record_accept(person: Dict[str, bool]) -> None:
+    _ACCEPTED_WINDOW.append(person)
+
+
+def _observed_freq(attr: str) -> float:
+    if not _ACCEPTED_WINDOW:
+        return 0.0
+    cnt = 0
+    for p in _ACCEPTED_WINDOW:
+        if p.get(attr, False):
+            cnt += 1
+    return cnt / len(_ACCEPTED_WINDOW)
+
+
+def _adjusted_p(attr: str, state) -> float:
+    """Weighted prior + observed frequency over last accepted window.
+    Target weights: 0.7 prior, 0.3 observed when window >= 50.
+    Scale observed weight linearly for smaller samples.
+    """
+    prior_p = float(state.freqs.get(attr, 0.3225))
+    obs_p = _observed_freq(attr)
+    # Scale observed weight up to 0.3 by 50 samples
+    w_obs = 0.3 * min(1.0, (len(_ACCEPTED_WINDOW) / 50.0) if 50.0 > 0 else 1.0)
+    w_prior = 1.0 - w_obs
+    p = w_prior * prior_p + w_obs * obs_p
+    # Clamp to [0.01, 0.99] to avoid degenerate bounds
+    return max(0.01, min(0.99, p))
+
+
 def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool:
+    accept = False
     # Fast accept-all once both minimums are met
     need = _need_map(state)
     if all(n <= 0 for n in need.values()):
-        return True
+        accept = True
+    else:
+        # Strong feasibility guard (must accept/reject cases)
+        forced = _must_accept_or_reject_by_feasibility(person, state)
+        if "force" in forced:
+            accept = bool(forced["force"])  # True: must accept, False: must reject
+        else:
+            # Expect exactly two attributes in Scenario 1
+            attrs = list(state.constraints.keys())
+            if len(attrs) < 2:
+                # Fallback: if the single attr is present, accept, else reject unless already met
+                a = attrs[0]
+                accept = person.get(a, False) or (need[a] <= 0)
+            else:
+                a1, a2 = attrs[0], attrs[1]
 
-    # Strong feasibility guard (must accept/reject cases)
-    forced = _must_accept_or_reject_by_feasibility(person, state)
-    if "force" in forced:
-        return bool(forced["force"])
+                has1 = bool(person.get(a1, False))
+                has2 = bool(person.get(a2, False))
 
-    # Expect exactly two attributes in Scenario 1
-    attrs = list(state.constraints.keys())
-    if len(attrs) < 2:
-        # Fallback: if the single attr is present, accept, else reject unless already met
-        a = attrs[0]
-        return person.get(a, False) or (need[a] <= 0)
-    a1, a2 = attrs[0], attrs[1]
+                # Sprint-to-finish: if > 90% full and both nearly met (<=20 short), accept anyone with at least one attr
+                if state.admitted_count >= 900:
+                    nearly1 = (state.constraints[a1] - state.counts.get(a1, 0)) <= 20
+                    nearly2 = (state.constraints[a2] - state.counts.get(a2, 0)) <= 20
+                    if nearly1 and nearly2 and (has1 or has2):
+                        accept = True
+                    # else fall through to standard logic
 
-    has1 = bool(person.get(a1, False))
-    has2 = bool(person.get(a2, False))
+                # Phase logic
+                n1 = need[a1]
+                n2 = need[a2]
 
-    # Phase logic
-    n1 = need[a1]
-    n2 = need[a2]
+                # Phase A: both below min -> accept if at least one attr
+                if not accept and n1 > 0 and n2 > 0:
+                    accept = has1 or has2
 
-    # Phase A: both below min -> accept if at least one attr
-    if n1 > 0 and n2 > 0:
-        return has1 or has2
+                # Phase B: one met, the other not -> primarily accept candidates with the unmet attr
+                if not accept and n1 <= 0 and n2 > 0:
+                    if has2:
+                        accept = True
+                    else:
+                        accept = _safe_wrong_side_accept(unmet_attr=a2, state=state)
+                if not accept and n2 <= 0 and n1 > 0:
+                    if has1:
+                        accept = True
+                    else:
+                        accept = _safe_wrong_side_accept(unmet_attr=a1, state=state)
 
-    # Phase B: one met, the other not -> primarily accept candidates with the unmet attr
-    # Additionally, near the end, allow safe "wrong-side" acceptance if stats suggest
-    # we can still reach the unmet minimum.
-    if n1 <= 0 and n2 > 0:
-        if has2:
-            return True
-        return _safe_wrong_side_accept(unmet_attr=a2, state=state)
-    if n2 <= 0 and n1 > 0:
-        if has1:
-            return True
-        return _safe_wrong_side_accept(unmet_attr=a1, state=state)
+                # Fallback (should be Phase C handled above): reject neither, else accept if any attr
+                if not accept:
+                    accept = has1 or has2
 
-    # Fallback (should be Phase C handled above): reject neither, else accept
-    return has1 or has2
+    # Record accepted candidate for empirical frequencies
+    if accept:
+        _record_accept(person)
+    return accept
 
 
 def _safe_wrong_side_accept(unmet_attr: str, state) -> bool:
@@ -107,11 +156,35 @@ def _safe_wrong_side_accept(unmet_attr: str, state) -> bool:
     need = max(0, M - cur)
     if need <= 0:
         return True
-    p = float(state.freqs.get(unmet_attr, 0.2))
+    # Use adjusted empirical frequency
+    p = float(_adjusted_p(unmet_attr, state))
     n = R - 1
     mu = n * p
     var = max(1e-6, n * p * (1 - p))
-    # z decays as we approach the end: early ~1.5, late ~0.5
-    z = 0.5 + 1.0 * min(1.0, max(0.0, (n / 200.0)))
+    # More aggressive z: early lower, rises slightly as buffer shrinks
+    # z = 0.3 + 0.5 * clamp((N - admitted)/N, 0, 1)
+    rem_frac = 0.0
+    if state.N > 0:
+        rem_frac = max(0.0, min(1.0, (state.N - state.admitted_count) / state.N))
+    z = 0.3 + 0.5 * rem_frac
     lcb = mu - z * (var ** 0.5)
-    return (cur + lcb) >= M
+    # Base check via LCB
+    if (cur + lcb) >= M:
+        return True
+
+    # Early buffer period: be a bit more willing in Phase B
+    # If we still have a comfortable expected surplus, accept wrong-side.
+    # Safety margin = current + expected_future - target
+    safety_margin = cur + mu - M
+    if state.admitted_count < 700 and safety_margin >= 15:
+        return True
+
+    # Optional: if margin is very healthy, relax even more
+    if safety_margin >= 30:
+        return True
+
+    # If margin is tight, stay conservative
+    if safety_margin <= 10:
+        return False
+
+    return False
