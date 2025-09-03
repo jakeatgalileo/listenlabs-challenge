@@ -704,6 +704,20 @@ def main():
             sys.stderr.write(
                 f"analyzed: seen={state.total_seen} admitted={k} rejected={rejected_local}\n"
             )
+            # Also show current quota progress per constraint (worst first)
+            try:
+                quota_items = []
+                for a, M_a in state.constraints.items():
+                    c = counts.get(a, 0)
+                    ratio = (c / M_a) if M_a else 1.0
+                    quota_items.append((ratio, a, c, M_a))
+                quota_items.sort(key=lambda x: x[0])  # lowest fulfillment first
+                preview = " ".join(f"{a}={c}/{M_a}" for _, a, c, M_a in quota_items)
+                if preview:
+                    sys.stderr.write(f"quota: {preview}\n")
+            except Exception:
+                # Non-fatal if formatting fails
+                pass
             sys.stderr.flush()
 
         # Progress every 100 admissions (server-reported counts)
@@ -735,5 +749,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
