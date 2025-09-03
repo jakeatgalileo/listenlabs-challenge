@@ -478,6 +478,7 @@ def decide_dyn(
 
 
 def main():
+    global TIMEOUT, DEFAULT_RETRIES
     p = argparse.ArgumentParser()
     p.add_argument("--base-url", required=True)
     p.add_argument("--scenario", type=int, choices=[1, 2, 3], required=True)
@@ -489,7 +490,6 @@ def main():
     args = p.parse_args()
 
     # Apply networking config before first request
-    global TIMEOUT, DEFAULT_RETRIES
     TIMEOUT = (args.connect_timeout, args.read_timeout)
     DEFAULT_RETRIES = args.retries
 
