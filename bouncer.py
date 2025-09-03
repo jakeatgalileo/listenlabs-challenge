@@ -570,6 +570,13 @@ def main():
             rejected_local += 1
             rejection_history.append(1)
 
+        # Print status every 10 people analyzed
+        if state.total_seen % 10 == 0:
+            sys.stderr.write(
+                f"analyzed: seen={state.total_seen} admitted={k} rejected={rejected_local}\n"
+            )
+            sys.stderr.flush()
+
         # Progress every 100 admissions (server-reported counts)
         admitted_server = res.get("admittedCount")
         rejected_server = res.get("rejectedCount")
