@@ -134,9 +134,8 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     need_qf = need.get("queer_friendly", 0)
     need_vc = need.get("vinyl_collector", 0)
 
-    # Padding: treat qf/vc as under target until a small buffer above min.
-    # This pulls QF/VC earlier so we don't end up with razor-thin feasibility.
-    PAD_QF = 0.06  # 6% padding
+    # Padding: keep a small buffer for VC; do NOT pad QF (we target 100% first)
+    PAD_QF = 0.0
     PAD_VC = 0.06  # 6% padding
     from math import ceil
     qf_min_padded = ceil(state.constraints.get("queer_friendly", 0) * (1.0 + PAD_QF))
@@ -144,8 +143,8 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     qf_under_padded = state.counts.get("queer_friendly", 0) < qf_min_padded
     vc_under_padded = state.counts.get("vinyl_collector", 0) < vc_min_padded
 
-    # Auto-accept QF/VC while under padded minima, with endgame feasibility guard
-    if (qf and qf_under_padded) or (vc and vc_under_padded):
+    # Auto-accept QF while under its minimum (not padded). Avoid auto-accepting VC during QF focus.
+    if qf and (state.counts.get("queer_friendly", 0) < state.constraints.get("queer_friendly", 0)):
         if R <= 120 and not _feasible(person, state):
             return False
         return True
@@ -167,30 +166,37 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
             if deficit_hits < 2:
                 return False
 
-    # Phase 1 focus: push QF to 90% of min; keep taking VC; occasionally accept GS/INTL
+    # Phase 1 focus: push QF to 100% of min; pick up GS/INTL along the way
     qf_ratio_min = state.counts.get("queer_friendly", 0) / max(1, state.constraints.get("queer_friendly", 0))
-    if qf_ratio_min < 0.9:
-        if qf or vc:
+    if qf_ratio_min < 1.0:
+        if qf:
             if R <= 120 and not _feasible(person, state):
                 return False
             return True
         # General guidance: accept some GS/INTL along the way
-        # - If moderately low (<55%), prefer strong utility: require BOTH GS and INTL
-        # - Otherwise, allow a small deterministic trickle: every 12th admit
+        # - If moderately low (<60%), accept
+        # - If candidate has BOTH GS and INTL, allow an occasional trickle: every 16th admit
         gs_ratio_min = state.counts.get("german_speaker", 0) / max(1, state.constraints.get("german_speaker", 0))
         intl_ratio_min = state.counts.get("international", 0) / max(1, state.constraints.get("international", 0))
         has_gs = person.get("german_speaker", False)
         has_intl = person.get("international", False)
-        LOW = 0.55
-        TRICKLE = 12
+        GS_LOW = 0.68
+        INTL_LOW = 0.60
+        TRICKLE = 16
         if need.get("german_speaker", 0) > 0 or need.get("international", 0) > 0:
-            # Strong backfill when clearly low: require both
-            if has_gs and has_intl and (gs_ratio_min < LOW or intl_ratio_min < LOW):
+            # Single-attribute backfill when moderately low
+            if (has_gs and gs_ratio_min < GS_LOW) or (has_intl and intl_ratio_min < INTL_LOW):
                 if R <= 120 and not _feasible(person, state):
                     return False
                 return True
-            # Otherwise trickle them in occasionally
-            if (has_gs or has_intl) and (state.admitted_count % TRICKLE == 0):
+            # Occasional high-utility combo
+            if has_gs and has_intl and (state.admitted_count % TRICKLE == 0):
+                if R <= 120 and not _feasible(person, state):
+                    return False
+                return True
+            # Occasional GS-only trickle when still needed
+            GS_TRICKLE = 20
+            if has_gs and (state.admitted_count % GS_TRICKLE == 0):
                 if R <= 120 and not _feasible(person, state):
                     return False
                 return True
