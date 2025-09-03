@@ -174,24 +174,26 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
             if R <= 120 and not _feasible(person, state):
                 return False
             return True
-        # Maintain GS/INTL around 50-60% during QF focus
+        # General guidance: accept some GS/INTL along the way
+        # - If moderately low (<55%), prefer strong utility: require BOTH GS and INTL
+        # - Otherwise, allow a small deterministic trickle: every 12th admit
         gs_ratio_min = state.counts.get("german_speaker", 0) / max(1, state.constraints.get("german_speaker", 0))
         intl_ratio_min = state.counts.get("international", 0) / max(1, state.constraints.get("international", 0))
-        HOLD_LOW, HOLD_HIGH = 0.50, 0.60
         has_gs = person.get("german_speaker", False)
         has_intl = person.get("international", False)
-
-        # Always backfill if under 50%
-        if (has_gs and gs_ratio_min < HOLD_LOW) or (has_intl and intl_ratio_min < HOLD_LOW):
-            if R <= 120 and not _feasible(person, state):
-                return False
-            return True
-
-        # Between 50-60%, only allow when the candidate hits BOTH GS and INTL
-        if has_gs and has_intl and ((gs_ratio_min < HOLD_HIGH) or (intl_ratio_min < HOLD_HIGH)):
-            if R <= 120 and not _feasible(person, state):
-                return False
-            return True
+        LOW = 0.55
+        TRICKLE = 12
+        if need.get("german_speaker", 0) > 0 or need.get("international", 0) > 0:
+            # Strong backfill when clearly low: require both
+            if has_gs and has_intl and (gs_ratio_min < LOW or intl_ratio_min < LOW):
+                if R <= 120 and not _feasible(person, state):
+                    return False
+                return True
+            # Otherwise trickle them in occasionally
+            if (has_gs or has_intl) and (state.admitted_count % TRICKLE == 0):
+                if R <= 120 and not _feasible(person, state):
+                    return False
+                return True
         return False
 
     # 3) Reservation mode phases while qf/vc still below target for non-qf/vc
