@@ -18,10 +18,11 @@ python bouncer.py \
 
 If the script errors out, you can resume:
 
-```
+```bash
 python bouncer.py \
   --base-url https://berghain.challenges.listenlabs.ai/ \
   --scenario 1 \
   --player-id d79fdbcc-46bd-4b65-b232-bc2c1adc2114 \
+  --connect-timeout 5 --read-timeout 30 --retries 5 \
   --checkpoint-dir ./.checkpoints
 ```
