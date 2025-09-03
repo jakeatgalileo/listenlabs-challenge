@@ -27,6 +27,7 @@ ENDGAME_REMAINING = 80        # conservative finishing window
 SCARCITY_CLIP = 5.0
 UNION_MARGIN_FRAC = 0.10      # slack fraction for B∧T union feasibility
 UNION_MARGIN_MIN = 8
+CREATIVE_AUTO_RATIO = 0.95    # auto-accept creatives until 95% of min
 
 
 def _remaining(state) -> int:
@@ -92,6 +93,10 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     R = _remaining(state)
     need = _need_map(state)
 
+    # 2) Unconditional creative acceptance (per strategy preference)
+    if person.get(A_C, False):
+        return True
+
     # 2) Moderate endgame guard
     if R <= ENDGAME_REMAINING:
         return _endgame_feasible(person, state)
@@ -144,24 +149,7 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
         ):
             return True
 
-    # 5) If union is tight but not critical (-margin <= U < margin), avoid C-only admits
-    if -union_margin <= U < union_margin and person.get(A_C, False) and not (has_B or has_T):
-        # allow only if creative need is still pressing
-        if need_C > 0 and (R - 1) * pC < 1.15 * need_C:
-            pass
-        else:
-            return False
-
-    # 6) Creative reservation (after union handling): preserve capacity for C except when B∧T present
-    need_C = need.get(A_C, 0)
-    pC = max(1e-6, state.freqs.get(A_C, 0.0))
-    if not (has_B and has_T):
-        if not person.get(A_C, False) and need_C > 0:
-            if (R - 1) * pC < ALPHA_CREATIVE_RESERVE * need_C:
-                return False
-        # Always take creatives while creative minimum unmet (unless union is critical handled above)
-        if person.get(A_C, False) and need_C > 0:
-            return True
+    # 5) (Removed) C-only avoidance and creative reservation – creatives are always accepted above
 
     # 6.5) Auto-accept struggling attributes until 90% (with guards)
     ratios: Dict[str, float] = {a: (state.counts.get(a, 0) / max(1, state.constraints.get(a, 1))) for a in state.constraints}
@@ -185,32 +173,33 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
         if (A_W in struggling) and has_W:
             return True
 
-    # 7) Scoring fallback with scarcity and synergy
+    # 6) Scoring fallback with scarcity and synergy (B weighted highest)
     scarcity: Dict[str, float] = {}
     for a in state.constraints:
         p = max(1e-6, state.freqs.get(a, 0.0))
         scarcity[a] = min(SCARCITY_CLIP, need[a] / max(1.0, R * p)) if R > 0 else (10.0 if need[a] > 0 else 0.0)
 
     s = 0.0
-    # Heavy weight for creative, stronger for uncommon B/T under scarcity, light for W
-    if person.get(A_C, False):
-        s += 1.0 * (1.0 + 3.0 * scarcity.get(A_C, 0.0))
+    # B weighted highest, then T, then W. C is auto-accepted above.
     if has_B:
-        s += 1.0 * (1.0 + 1.8 * scarcity.get(A_B, 0.0))
+        s += 1.2 * (1.0 + 2.2 * scarcity.get(A_B, 0.0))
     else:
         if need_B > 0:
-            s -= 0.5 * (1.0 + 1.2 * scarcity.get(A_B, 0.0))
+            s -= 0.6 * (1.0 + 1.2 * scarcity.get(A_B, 0.0))
     if has_T:
-        s += 1.0 * (1.0 + 1.5 * scarcity.get(A_T, 0.0))
+        s += 0.8 * (1.0 + 1.1 * scarcity.get(A_T, 0.0))
     else:
         if need_T > 0:
-            s -= 0.5 * (1.0 + 1.1 * scarcity.get(A_T, 0.0))
+            s -= 0.4 * (1.0 + 1.0 * scarcity.get(A_T, 0.0))
     if has_W:
-        s += 0.3 * (1.0 + 0.5 * scarcity.get(A_W, 0.0))
+        s += 0.5 * (1.0 + 0.6 * scarcity.get(A_W, 0.0))
+    else:
+        if need_W > 0:
+            s -= 0.2 * (1.0 + 0.6 * scarcity.get(A_W, 0.0))
 
     # Explicit synergy bonus when both B and T present
     if has_B and has_T:
-        s += 2.0
+        s += 1.5
 
     # Light correlation bonus toward unmet, scarcity-weighted needs
     for a_true, v in person.items():

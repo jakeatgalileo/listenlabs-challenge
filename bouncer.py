@@ -626,8 +626,7 @@ def main():
     p.add_argument("--connect-timeout", type=float, default=DEFAULT_CONNECT_TIMEOUT)
     p.add_argument("--read-timeout", type=float, default=DEFAULT_READ_TIMEOUT)
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
-    p.add_argument("--checkpoint-dir", default=".")
-    p.add_argument("--no-auto-resume", action="store_true")
+    # Removed checkpoint/resume flags to simplify parallel runs
     # Scarcity tuning
     p.add_argument("--scarcity-mult", type=float, default=1.0, help="multiply all scarcity weights for quick tuning")
     args = p.parse_args()
@@ -646,133 +645,46 @@ def main():
         except Exception:
             pass
     
-    def _checkpoint_path(player_id: str, scenario: int, directory: str) -> str:
-        safe_player = "".join(ch for ch in player_id if ch.isalnum() or ch in ("-", "_"))
-        return os.path.join(directory, f".bouncer_{safe_player}_s{scenario}.json")
+    # Always start a fresh game; no resume/checkpointing
+    init = start_game(args.base_url, args.scenario, args.player_id)
+    game_id = init["gameId"]
+    constraints = init["constraints"]  # list of {attribute, minCount}
+    attr_stats = init.get("attributeStatistics", {})
+    rel_freqs = attr_stats.get("relativeFrequencies", {})
+    correlations = attr_stats.get("correlations", {})
 
-    def _save_checkpoint(path: str, payload: Dict[str, Any]) -> None:
-        try:
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            tmp_path = path + ".tmp"
-            with open(tmp_path, "w") as f:
-                json.dump(payload, f)
-            os.replace(tmp_path, path)
-        except Exception:
-            pass
+    N = DEFAULT_N
+    # Required counts (optionally buffered)
+    M: Dict[str, int] = {}
+    for c in constraints:
+        base = int(c["minCount"])
+        buff = int(math.ceil(config.buffer_multiplier * math.sqrt(N))) if config.buffer_multiplier > 0 else 0
+        M[c["attribute"]] = min(N, base + buff)
 
-    def _load_checkpoint(path: str) -> Optional[Dict[str, Any]]:
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except Exception:
-            return None
+    counts: Dict[str, int] = {a: 0 for a in M}
+    k = 0  # admitted
+    rejected_local = 0
 
-    cp_path = _checkpoint_path(args.player_id, args.scenario, args.checkpoint_dir)
-    resume_payload = None if args.no_auto_resume else _load_checkpoint(cp_path)
+    # Initialize dynamic state
+    # Ensure seen_counts covers all attributes (stats + constraints)
+    freq_keys = {str(a) for a in rel_freqs.keys()} | {str(a) for a in M.keys()}
+    seeded_freqs = {a: float(rel_freqs.get(a, 0.2)) for a in freq_keys}
+    state = GameState(
+        N=N,
+        constraints=M,
+        counts=counts,
+        freqs=seeded_freqs,
+        corr={str(a1): {str(a2): float(c) for a2, c in correlations.get(a1, {}).items()} for a1 in correlations},
+        admitted_count=0,
+        rejected_local=0,
+        seen_counts={a: 0 for a in freq_keys},
+        total_seen=0,
+    )
 
-    if resume_payload:
-        game_id = resume_payload.get("gameId")
-        N = int(resume_payload.get("N", DEFAULT_N))
-        M = {str(k): int(v) for k, v in resume_payload.get("constraints", {}).items()}
-        counts = {str(k): int(v) for k, v in resume_payload.get("counts", {}).items()}
-        k = int(resume_payload.get("admitted", 0))
-        rejected_local = int(resume_payload.get("rejected_local", 0))
-        freqs = {str(k): float(v) for k, v in resume_payload.get("freqs", {}).items()}
-        correlations = {str(a1): {str(a2): float(c) for a2, c in resume_payload.get("corr", {}).get(a1, {}).items()} for a1 in resume_payload.get("corr", {})}
-        seen_counts_loaded = {str(k): int(v) for k, v in resume_payload.get("seen_counts", {}).items()}
-        total_seen_loaded = int(resume_payload.get("total_seen", 0))
-        accept_all_flag = bool(resume_payload.get("accept_all_after_min_met", False))
-        last_next_person = resume_payload.get("nextPerson")
-        admitted_server = resume_payload.get("admitted_server", k)
-        rejected_server = resume_payload.get("rejected_server", rejected_local)
-
-        state = GameState(
-            N=N,
-            constraints=M,
-            counts=counts,
-            freqs=freqs,
-            corr=correlations,
-            admitted_count=k,
-            rejected_local=rejected_local,
-            seen_counts=seen_counts_loaded if seen_counts_loaded else {a: 0 for a in freqs},
-            total_seen=total_seen_loaded,
-            accept_all_after_min_met=accept_all_flag,
-        )
-
-        # (removed) previously restored scenario-specific frontload tracking
-
-        # Synthesize a response so the loop can continue
-        res = {
-            "status": "running",
-            "nextPerson": last_next_person,
-            "admittedCount": admitted_server,
-            "rejectedCount": rejected_server,
-        }
-        last_progress_admitted = int(admitted_server) if isinstance(admitted_server, int) else 0
-        rejection_history = list(resume_payload.get("rejection_history", []))
-    else:
-        init = start_game(args.base_url, args.scenario, args.player_id)
-        game_id = init["gameId"]
-        constraints = init["constraints"]  # list of {attribute, minCount}
-        attr_stats = init.get("attributeStatistics", {})
-        rel_freqs = attr_stats.get("relativeFrequencies", {})
-        correlations = attr_stats.get("correlations", {})
-
-        N = DEFAULT_N
-        # Required counts (optionally buffered)
-        M: Dict[str, int] = {}
-        for c in constraints:
-            base = int(c["minCount"])
-            buff = int(math.ceil(config.buffer_multiplier * math.sqrt(N))) if config.buffer_multiplier > 0 else 0
-            M[c["attribute"]] = min(N, base + buff)
-
-        counts: Dict[str, int] = {a: 0 for a in M}
-        k = 0  # admitted
-        rejected_local = 0
-
-        # Initialize dynamic state
-        # Ensure seen_counts covers all attributes (stats + constraints)
-        freq_keys = {str(a) for a in rel_freqs.keys()} | {str(a) for a in M.keys()}
-        seeded_freqs = {a: float(rel_freqs.get(a, 0.2)) for a in freq_keys}
-        state = GameState(
-            N=N,
-            constraints=M,
-            counts=counts,
-            freqs=seeded_freqs,
-            corr={str(a1): {str(a2): float(c) for a2, c in correlations.get(a1, {}).items()} for a1 in correlations},
-            admitted_count=0,
-            rejected_local=0,
-            seen_counts={a: 0 for a in freq_keys},
-            total_seen=0,
-        )
-
-        # First person: no decision parameter
-        res = decide_and_next(args.base_url, game_id, 0, None)
-        last_progress_admitted = 0
-        rejection_history = []
-        # Persist initial checkpoint
-        _save_checkpoint(
-            cp_path,
-            {
-                "gameId": game_id,
-                "scenario": args.scenario,
-                "playerId": args.player_id,
-                "N": N,
-                "constraints": M,
-                "counts": counts,
-                "freqs": state.freqs,
-                "corr": state.corr,
-                "admitted": k,
-                "rejected_local": rejected_local,
-                "total_seen": state.total_seen,
-                "seen_counts": state.seen_counts,
-                "rejection_history": rejection_history,
-                "accept_all_after_min_met": state.accept_all_after_min_met,
-                "nextPerson": res.get("nextPerson"),
-                "admitted_server": res.get("admittedCount"),
-                "rejected_server": res.get("rejectedCount"),
-            },
-        )
+    # First person: no decision parameter
+    res = decide_and_next(args.base_url, game_id, 0, None)
+    last_progress_admitted = 0
+    rejection_history = []
     while res.get("status") == "running" and res.get("nextPerson"):
         person = res["nextPerson"]
         idx = person["personIndex"]
@@ -822,29 +734,7 @@ def main():
             rejected_local += 1
             rejection_history.append(1)
 
-        # Persist checkpoint after each decision
-        _save_checkpoint(
-            cp_path,
-            {
-                "gameId": game_id,
-                "scenario": args.scenario,
-                "playerId": args.player_id,
-                "N": N,
-                "constraints": M,
-                "counts": counts,
-                "freqs": state.freqs,
-                "corr": state.corr,
-                "admitted": k,
-                "rejected_local": rejected_local,
-                "total_seen": state.total_seen,
-                "seen_counts": state.seen_counts,
-                "rejection_history": rejection_history[-500:],
-                "accept_all_after_min_met": state.accept_all_after_min_met,
-                "nextPerson": res.get("nextPerson"),
-                "admitted_server": res.get("admittedCount"),
-                "rejected_server": res.get("rejectedCount"),
-            },
-        )
+        # No checkpoint persistence
 
         # Print status every 10 people analyzed
         if state.total_seen % 10 == 0:
@@ -891,16 +781,9 @@ def main():
     status = res.get("status")
     if status == "completed":
         print(f"completed: rejected={res.get('rejectedCount')}")
-        # Clean up checkpoint on success
-        try:
-            if os.path.exists(cp_path):
-                os.remove(cp_path)
-        except Exception:
-            pass
         return
     if status == "failed":
         print(f"failed: reason={res.get('reason')}")
-        # Keep checkpoint for possible resume
         return
 
     # Fallback

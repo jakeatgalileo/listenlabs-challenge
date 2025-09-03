@@ -128,6 +128,16 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     need = _need_map(state)
     scarcity = _scarcity_map(state)
 
+    # Promote rare categories while under minimum (subject to endgame feasibility)
+    qf = person.get("queer_friendly", False)
+    vc = person.get("vinyl_collector", False)
+    need_qf = need.get("queer_friendly", 0)
+    need_vc = need.get("vinyl_collector", 0)
+    if (qf and need_qf > 0) or (vc and need_vc > 0):
+        if R <= 120 and not _feasible(person, state):
+            return False
+        return True
+
     # 3) Scarcity-aware early accept: take highly scarce contributors
     general_criticality = 0.7
     scarce_hits = [
@@ -139,16 +149,16 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
         return True
 
     # 4) High-value correlation rules (qf-vc-gs synergy)
-    qf = person.get("queer_friendly", False)
-    vc = person.get("vinyl_collector", False)
     gs = person.get("german_speaker", False)
 
-    # Always accept qf+vc (leverages 0.48 correlation)
-    if qf and vc:
+    # Accept qf+vc combo if either is still needed (leverages 0.48 correlation)
+    if qf and vc and (need_qf > 0 or need_vc > 0):
         return True
 
-    # Strong combos with german speaker
-    if (qf and gs) or (vc and gs):
+    # Strong combos with german speaker when still needed
+    if (qf and gs) and (need_qf > 0 or need.get("german_speaker", 0) > 0):
+        return True
+    if (vc and gs) and (need_vc > 0 or need.get("german_speaker", 0) > 0):
         return True
 
     # Scarcity-priority for rare attrs
@@ -158,10 +168,26 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     ):
         return True
 
-    # Prioritized deficit-first for the hard attributes
+    # Prioritized deficit-first for the hard attributes (<100%)
+    # Keep a slightly stricter gate: only prioritize if < 90% filled or scarce
     for a in ("queer_friendly", "vinyl_collector", "german_speaker", "international"):
-        if need.get(a, 0) > 0 and person.get(a, False):
-            return True
+        M = state.constraints.get(a, 0)
+        c = state.counts.get(a, 0)
+        if person.get(a, False) and M > 0:
+            if (c < 0.9 * M) or (scarcity.get(a, 0.0) >= 0.7):
+                return True
+
+    # 4b) Reservation mode: when qf or vc are under minimum, only accept
+    # non-qf/vc candidates if they help an underfilled attribute
+    qf_under = state.counts.get("queer_friendly", 0) < state.constraints.get("queer_friendly", 0)
+    vc_under = state.counts.get("vinyl_collector", 0) < state.constraints.get("vinyl_collector", 0)
+    if (qf_under or vc_under) and not (qf or vc):
+        underfilled = [
+            a for a, M in state.constraints.items()
+            if M > 0 and state.counts.get(a, 0) < M
+        ]
+        if not any(person.get(a, False) for a in underfilled):
+            return False
 
     # 5) Endgame: conservative feasibility + EV
     if R <= 120:

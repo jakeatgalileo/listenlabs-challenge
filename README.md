@@ -14,7 +14,6 @@ python bouncer.py \
   --scenario 1 \
   --player-id d79fdbcc-46bd-4b65-b232-bc2c1adc2114 \
   --connect-timeout 5 --read-timeout 120 --retries 1
-    --checkpoint-dir ./.checkpoints
 ```
 
 ```bash
@@ -23,7 +22,6 @@ python bouncer.py \
   --scenario 2 \
   --player-id d79fdbcc-46bd-4b65-b232-bc2c1adc2114 \
   --connect-timeout 5 --read-timeout 120 --retries 1
-    --checkpoint-dir ./.checkpoints
 ```
 
 ```bash
@@ -32,7 +30,6 @@ python bouncer.py \
   --scenario 3 \
   --player-id d79fdbcc-46bd-4b65-b232-bc2c1adc2114 \
   --connect-timeout 5 --read-timeout 120 --retries 1
-    --checkpoint-dir ./.checkpoints
 ```
 
 ## How it works
