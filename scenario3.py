@@ -143,8 +143,8 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     qf_under_padded = state.counts.get("queer_friendly", 0) < qf_min_padded
     vc_under_padded = state.counts.get("vinyl_collector", 0) < vc_min_padded
 
-    # Unconditional preference: accept all vinyl_collectors we see (feasibility-guarded late).
-    if vc:
+    # Accept all vinyl_collectors while under their minimum (feasibility-guarded late).
+    if vc and (state.counts.get("vinyl_collector", 0) < state.constraints.get("vinyl_collector", 0)):
         if R <= 120 and not _feasible(person, state):
             return False
         return True
@@ -185,7 +185,7 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
         intl_ratio_min = state.counts.get("international", 0) / max(1, state.constraints.get("international", 0))
         has_gs = person.get("german_speaker", False)
         has_intl = person.get("international", False)
-        TRICKLE_COMBO = 30
+        TRICKLE_COMBO = 24
         if need.get("german_speaker", 0) > 0 or need.get("international", 0) > 0:
             # Occasional high-utility combo only
             if has_gs and has_intl and (state.admitted_count % TRICKLE_COMBO == 0):
