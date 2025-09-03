@@ -156,29 +156,38 @@ def constraint_score(
     w_help: float,
     w_penalty: float,
     w_corr: float,
+    need: Dict[str, int],
+    urgency: Dict[str, float],
+    scarcity: Dict[str, float],
+    w_scarcity_help: float,
+    w_scarcity_penalty: float,
+    w_corr_scarcity: float,
 ) -> float:
-    R = max(1, state.N - state.admitted_count)
     s = 0.0
-    need = {a: max(0, state.constraints[a] - state.counts.get(a, 0)) for a in state.constraints}
-    urgency = {a: need[a] / R for a in state.constraints}
 
-    # Direct contribution
+    # Direct contribution and penalty (scarcity-weighted)
     for a in state.constraints:
+        u = urgency[a]
+        Sa = scarcity[a]
         if person.get(a, False):
-            s += w_help * urgency[a]
+            s += w_help * u * (1.0 + w_scarcity_help * Sa)
         else:
-            s -= w_penalty * urgency[a]
+            if need[a] > 0:
+                s -= w_penalty * u * (1.0 + w_scarcity_penalty * Sa)
 
-    # Correlation bonus
+    # Correlation bonus toward unmet, scarce targets
     for a1, v in person.items():
         if not v:
             continue
-        for a2, u in urgency.items():
+        for a2 in state.constraints:
             if need[a2] <= 0:
                 continue
             c = state.corr.get(a1, {}).get(a2, 0.0)
-            if c > 0:
-                s += w_corr * c * u
+            if c <= 0.0:
+                continue
+            u2 = urgency[a2]
+            Sa2 = scarcity[a2]
+            s += w_corr * c * u2 * (1.0 + w_corr_scarcity * Sa2)
     return s
 
 
@@ -218,6 +227,27 @@ def update_adaptive_freqs(state: GameState, k0: int = 100) -> None:
 # =====================
 # Enhanced optimizations
 # =====================
+def compute_need_urgency_scarcity(
+    state: GameState, scarcity_clip: float
+) -> Tuple[Dict[str, int], Dict[str, float], Dict[str, float]]:
+    """
+    Compute per-attribute need, urgency, and scarcity metrics.
+    - R = max(1, N − admitted_count)
+    - need[a] = max(0, M[a] − counts[a])
+    - p[a] = max(1e-6, freqs[a])
+    - S[a] = min(scarcity_clip, need[a] / max(1.0, R * p[a]))
+    """
+    R = max(1, state.N - state.admitted_count)
+    need: Dict[str, int] = {
+        a: max(0, state.constraints[a] - state.counts.get(a, 0))
+        for a in state.constraints
+    }
+    urgency: Dict[str, float] = {a: (need[a] / R) for a in state.constraints}
+    S: Dict[str, float] = {}
+    for a in state.constraints:
+        p = max(1e-6, state.freqs.get(a, 0.0))
+        S[a] = min(scarcity_clip, need[a] / max(1.0, R * p))
+    return need, urgency, S
 
 def all_constraints_met(state: GameState) -> bool:
     for a, M_a in state.constraints.items():
@@ -257,15 +287,41 @@ def enhanced_correlation_score(
 
 @dataclass
 class ScenarioConfig:
-    """Tuned parameters for each scenario"""
-    endgame_size: int
-    w_help: float
-    w_penalty: float
-    w_corr: float
-    base_start: float
-    buffer_multiplier: float  # For constraint buffering
+    """
+    Tuned parameters for each scenario.
+
+    Scarcity-weighted knobs (backward-compatible defaults):
+    - w_scarcity_help: scales reward for having rare needed attrs.
+    - w_scarcity_penalty: scales penalty for missing rare needed attrs.
+    - w_corr_scarcity: scales correlation bonus toward rare needed attrs.
+    - criticality_accept_threshold: immediate accept if any contributed attr
+      has scarcity S[a] >= threshold.
+    - scarcity_clip: cap S[a] to avoid explosion.
+
+    Scarcity definition for attribute a:
+    - R = max(1, N − admitted_count)
+    - need[a] = max(0, M[a] − counts[a])
+    - p[a] = max(1e-6, freqs[a])
+    - S[a] = min(scarcity_clip, need[a] / max(1.0, R * p[a]))
+    """
+    endgame_size: int         # Remaining spots threshold for conservative endgame; smaller = stay permissive longer
+    w_help: float             # Weight for having needed attrs; higher = more accepting
+    w_penalty: float          # Penalty when attrs are missing; lower = more accepting
+    w_corr: float             # Bonus from positive correlations to needed attrs; higher = more accepting
+    base_start: float         # Baseline acceptance threshold early on; lower = more accepting
+    buffer_multiplier: float  # Extra buffer on min counts (+ceil(mult*sqrt(N))); lower = more accepting
+    # Scarcity-weighted controls (defaults keep legacy behavior)
+    w_scarcity_help: float = 0.0
+    w_scarcity_penalty: float = 0.0
+    w_corr_scarcity: float = 0.0
+    criticality_accept_threshold: float = 0.6
+    scarcity_clip: float = 5.0
 
 
+# Tuning: 
+# accept more 
+# => decrease endgame_size/base_start/w_penalty/buffer_multiplier; 
+# => increase w_help/w_corr
 SCENARIO_CONFIGS: Dict[int, ScenarioConfig] = {
     1: ScenarioConfig(
         endgame_size=30,
@@ -274,6 +330,12 @@ SCENARIO_CONFIGS: Dict[int, ScenarioConfig] = {
         w_corr=0.15,
         base_start=0.3,
         buffer_multiplier=0.0,
+        # Scarcity-heavy defaults
+        w_scarcity_help=2.0,
+        w_scarcity_penalty=1.5,
+        w_corr_scarcity=1.0,
+        criticality_accept_threshold=0.7,
+        scarcity_clip=5.0,
     ),
     2: ScenarioConfig(
         endgame_size=50,
@@ -282,6 +344,12 @@ SCENARIO_CONFIGS: Dict[int, ScenarioConfig] = {
         w_corr=0.2,
         base_start=0.5,
         buffer_multiplier=0.05,
+        # Scarcity-heavy defaults
+        w_scarcity_help=2.5,
+        w_scarcity_penalty=2.0,
+        w_corr_scarcity=1.2,
+        criticality_accept_threshold=0.7,
+        scarcity_clip=5.0,
     ),
     3: ScenarioConfig(
         endgame_size=100,
@@ -290,6 +358,12 @@ SCENARIO_CONFIGS: Dict[int, ScenarioConfig] = {
         w_corr=0.3,
         base_start=0.7,
         buffer_multiplier=0.1,
+        # Scarcity-heavy defaults
+        w_scarcity_help=3.0,
+        w_scarcity_penalty=2.5,
+        w_corr_scarcity=1.5,
+        criticality_accept_threshold=0.75,
+        scarcity_clip=5.0,
     ),
 }
 
@@ -329,27 +403,22 @@ def adaptive_threshold_with_history(
 def prioritized_deficit_check(
     person: Dict[str, bool],
     state: GameState,
+    scarcity: Dict[str, float],
+    threshold: float,
 ) -> Tuple[bool, float]:
     """
-    Prioritize constraints by criticality
+    Scarcity-aware early accept: accept if any contributed attr has
+    S[a] >= threshold. Returns (accept, max_S_present).
     """
-    R = state.N - state.admitted_count
-
-    critical_attrs: List[Tuple[str, float]] = []
-    for a, M_a in state.constraints.items():
-        need = max(0, M_a - state.counts.get(a, 0))
-        if need <= 0:
-            continue
-        max_possible = need + R * state.freqs.get(a, 1.0)
-        criticality = need / max(0.01, max_possible - need)
-        if person.get(a, False):
-            critical_attrs.append((a, criticality))
-
-    if critical_attrs:
-        max_criticality = max(c for _, c in critical_attrs)
-        return True, max_criticality
-
-    return False, 0.0
+    candidates = [
+        scarcity[a]
+        for a in state.constraints
+        if person.get(a, False) and (scarcity.get(a, 0.0) > 0.0)
+    ]
+    if not candidates:
+        return False, 0.0
+    max_s = max(candidates)
+    return (max_s >= threshold), max_s
 
 
 def calculate_expected_value(
@@ -407,8 +476,33 @@ def decide_enhanced(
             state.accept_all_after_min_met = True
         return True
 
-    accept, criticality = prioritized_deficit_check(person, state)
-    if accept and criticality > 0.5:
+    # Precompute scarcity maps
+    need, urgency, scarcity = compute_need_urgency_scarcity(state, config.scarcity_clip)
+
+    accept_by_scarcity, max_s_present = prioritized_deficit_check(
+        person,
+        state,
+        scarcity,
+        config.criticality_accept_threshold,
+    )
+    if accept_by_scarcity:
+        if VERBOSE:
+            # identify the most scarce contributed attribute for diagnostics
+            best_attr = None
+            best_S = -1.0
+            for a in state.constraints:
+                if person.get(a, False):
+                    Sa = scarcity.get(a, 0.0)
+                    if Sa > best_S:
+                        best_S = Sa
+                        best_attr = a
+            if best_attr is not None:
+                R = max(1, state.N - state.admitted_count)
+                p = max(1e-6, state.freqs.get(best_attr, 0.0))
+                sys.stderr.write(
+                    f"scarcity-accept: attr={best_attr} S={best_S:.3f} need={need.get(best_attr, 0)} R={R} p={p:.4f}\n"
+                )
+                sys.stderr.flush()
         return True
 
     R = state.N - state.admitted_count
@@ -424,6 +518,12 @@ def decide_enhanced(
         config.w_help,
         config.w_penalty,
         config.w_corr,
+        need,
+        urgency,
+        scarcity,
+        config.w_scarcity_help,
+        config.w_scarcity_penalty,
+        config.w_corr_scarcity,
     )
 
     correlation_bonus = enhanced_correlation_score(person, state)
@@ -435,6 +535,13 @@ def decide_enhanced(
         rejection_history,
         window_size=min(100, state.total_seen),
     )
+
+    # Optional tweak: when max scarcity is high, slightly ease threshold
+    try:
+        max_scarcity = max(scarcity.values()) if scarcity else 0.0
+        threshold *= (1.0 - min(0.2, 0.05 * max_scarcity))
+    except Exception:
+        pass
 
     return total_score >= threshold
 
@@ -489,7 +596,21 @@ def decide_dyn(
         return conservative_endgame(person, state)
 
     # Score vs threshold
-    s = constraint_score(person, state, w_help, w_penalty, w_corr)
+    # Use legacy behavior (no scarcity weights) by passing zeros
+    need, urgency, scarcity = compute_need_urgency_scarcity(state, scarcity_clip=5.0)
+    s = constraint_score(
+        person,
+        state,
+        w_help,
+        w_penalty,
+        w_corr,
+        need,
+        urgency,
+        scarcity,
+        0.0,
+        0.0,
+        0.0,
+    )
     thr = dynamic_threshold(state, base_start)
     return s >= thr
 
@@ -506,14 +627,23 @@ def main():
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
     p.add_argument("--checkpoint-dir", default=".")
     p.add_argument("--no-auto-resume", action="store_true")
+    # Scarcity tuning
+    p.add_argument("--scarcity-mult", type=float, default=1.0, help="multiply all scarcity weights for quick tuning")
     args = p.parse_args()
 
     # Apply networking config before first request
     TIMEOUT = (args.connect_timeout, args.read_timeout)
     DEFAULT_RETRIES = args.retries
 
-    # Scenario config
+    # Scenario config (apply scarcity multiplier in-place for chosen scenario)
     config = SCENARIO_CONFIGS.get(args.scenario, SCENARIO_CONFIGS[2])
+    if args.scarcity_mult != 1.0:
+        try:
+            config.w_scarcity_help *= args.scarcity_mult
+            config.w_scarcity_penalty *= args.scarcity_mult
+            config.w_corr_scarcity *= args.scarcity_mult
+        except Exception:
+            pass
     
     def _checkpoint_path(player_id: str, scenario: int, directory: str) -> str:
         safe_player = "".join(ch for ch in player_id if ch.isalnum() or ch in ("-", "_"))
@@ -712,9 +842,22 @@ def main():
                     ratio = (c / M_a) if M_a else 1.0
                     quota_items.append((ratio, a, c, M_a))
                 quota_items.sort(key=lambda x: x[0])  # lowest fulfillment first
-                preview = " ".join(f"{a}={c}/{M_a}" for _, a, c, M_a in quota_items)
-                if preview:
-                    sys.stderr.write(f"quota: {preview}\n")
+                payload = {
+                    "type": "constraints_progress",
+                    "seen": state.total_seen,
+                    "admitted": k,
+                    "rejected": rejected_local,
+                    "constraints": [
+                        {
+                            "attribute": a,
+                            "current": c,
+                            "min": M_a,
+                            "ratio": (c / M_a) if M_a else 1.0,
+                        }
+                        for _, a, c, M_a in quota_items
+                    ],
+                }
+                sys.stderr.write(json.dumps(payload, indent=2, sort_keys=False) + "\n")
             except Exception:
                 # Non-fatal if formatting fails
                 pass

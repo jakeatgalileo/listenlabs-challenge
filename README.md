@@ -16,3 +16,28 @@ python bouncer.py \
   --connect-timeout 5 --read-timeout 120 --retries 1
     --checkpoint-dir ./.checkpoints
 ```
+
+```bash
+python bouncer.py \
+  --base-url https://berghain.challenges.listenlabs.ai/ \
+  --scenario 2 \
+  --player-id d79fdbcc-46bd-4b65-b232-bc2c1adc2114 \
+  --connect-timeout 5 --read-timeout 120 --retries 1
+    --checkpoint-dir ./.checkpoints
+```
+
+```bash
+python bouncer.py \
+  --base-url https://berghain.challenges.listenlabs.ai/ \
+  --scenario 3 \
+  --player-id d79fdbcc-46bd-4b65-b232-bc2c1adc2114 \
+  --connect-timeout 5 --read-timeout 120 --retries 1
+    --checkpoint-dir ./.checkpoints
+```
+
+## How it works
+
+- Dynamic threshold: becomes more permissive as the venue fills.
+- Constraint scoring: weighs how each person helps unmet minimums.
+- Endgame feasibility: avoids choices that could make constraints impossible.
+- Scarcity-weighted prioritization: prioritizes rare-but-required attributes using a per-attribute scarcity S[a] = need[a] / (R \* p[a]) with clipping. Direct help, missing penalties, and correlation bonuses are scaled by scarcity, and an early accept triggers if a candidate contributes to highly scarce requirements. Tune via scenario configs or `--scarcity-mult`.
