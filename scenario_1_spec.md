@@ -1,59 +1,49 @@
 # Scenario 1 — Spec: Two Symmetric Min-Count Attributes
 
-Goal: Meet both minimums with minimal rejections using a feasibility‑guarded greedy policy for two symmetric attributes: `young` and `well_dressed`.
+Goal: Meet both minimums with minimal rejections using a feasibility‑guarded, phase‑based policy for two symmetric attributes: `young` and `well_dressed`.
 
 Inputs/State
 - `person`: map of attributes → bool.
-- `state`: `N`, `admitted_count`, `counts[a]`, `constraints[a]`, `freqs[a]`, `corr[a][b]`.
+- `state`: `N`, `admitted_count`, `counts[a]`, `constraints[a]`, `freqs[a]`.
 - `rejection_history`: recent 0/1 rejects (not central here).
 
-Key Invariants & Guards
-- Hard feasibility (per‑person): if `(R-1) < need[a]` then:
-  - If `person[a]` → force accept; else → force reject.
-- LCB safety for risky admits: for wrong‑side or neither admits, require for each affected `a`:
-  - `cur[a] + LCB(n=R-1, p=adjusted_p[a]) >= minCount[a]`.
+Guards
+- Feasibility force: let `R = N - admitted`, `need[a] = max(0, min[a] - counts[a])`.
+  - If `R <= need[young]` → must accept iff person has `young`.
+  - If `R <= need[well_dressed]` → must accept iff person has `well_dressed`.
 
-Frequency Estimate (adjusted_p)
-- Blend prior and empirical from last 100 accepted: `p = w_prior*prior + w_obs*observed`.
-- `w_obs` scales to 0.3 by 50 samples; clamp `p ∈ [0.01, 0.99]`.
+Empirical Frequency (for neither safety)
+- Maintain last 100 accepted (`_ACCEPTED_WINDOW`).
+- `_adjusted_p(a) = w_prior*prior + w_obs*observed` with `w_obs` up to 0.3 by 50 samples; clamp to `[0.01, 0.99]`.
 
-LCB Formula
-- `n = R - 1`, `mu = n*p`, `var = n*p*(1-p)`, `z = 0.3 + 0.5 * ((N - admitted)/N)`.
-- `LCB = mu - z*sqrt(var)`.
+LCB Feasibility for Neither
+- For a candidate with neither attribute, accept only if for each `a ∈ {young, well_dressed}`:
+  - `cur[a] + LCB(n=R-1, p=_adjusted_p[a]) ≥ min[a]`, where `LCB = n*p − z*sqrt(n*p*(1-p))` and `z = 0.3 + 0.5 * ((N - admitted)/N)`.
 
-Decision Flow (high level)
-1) If both minima already met → accept all (minimize rejections).
-2) Apply feasibility force (accept/reject) if triggered.
-3) Early fill (admitted < 90% of `N`):
-   - Accept if person has at least one attr.
-   - If neither, accept only if LCB says both constraints remain feasible.
-4) Sprint finish (> 900 admitted): if both are within 20 of min and person has any attr → accept.
-5) Phase A (both unmet): accept any with ≥1 attr; allow neither only if LCB‑safe for both.
-6) Phase B (one met, one unmet):
-   - If person has unmet attr (including both) → accept.
-   - Else, accept only if `_safe_wrong_side_accept(unmet)` LCB check passes.
-7) Fallback: accept if any attr; else accept neither only if `_safe_accept_neither` passes.
-
-Pseudocode
-- R = N - admitted; need[a] = max(0, min[a] - counts[a])
-- If all need == 0: return True
-- forced = feasibility_guard(person)
-- If forced: return forced
-- If pre90 and (has1 or has2): return True; elif pre90 and LCB_safe_both(): return True
-- If admitted >= 900 and nearly_met_both and (has1 or has2): return True
-- If need[a1] > 0 and need[a2] > 0: if (has1 or has2) return True; elif LCB_safe_both() return True
-- If need[a1] <= 0 < need[a2]: if has2 return True; elif safe_wrong_side(a2) return True (symmetrically for a1)
-- Else: if (has1 or has2) return True; elif LCB_safe_both() return True; else False
+Decision Flow
+1) If both minima met → accept all (minimize rejections).
+2) Apply feasibility force rules (above) if triggered.
+3) Phase A (both unmet):
+   - If both attributes true → accept.
+   - If exactly one true → accept with probability based on safety margin for that attribute:
+     - `expected_other = (R-1)*p_other` with calibrated priors `p ≈ 0.3225`.
+     - If margin < −5 → accept; < 10 → 70%; < 20 → 40%; else → 20%.
+   - If neither and `_safe_accept_neither()` → accept with dynamic probability schedule: 60% (<300 admitted), 40% (<700), 25% (<900), else 12%.
+4) Phase B (one met):
+   - If person has the unmet attribute (including both) → accept.
+   - If neither and `_safe_accept_neither()` → accept with the same schedule as above.
+   - If only the met attribute: accept based on unmet side safety margin: > 20 → accept; > 10 → 50%; > 5 → 20%; else reject.
+5) Default fallback: accept (should be unreachable under normal states).
 
 Tunables
-- Accept window: 100; pre‑90% threshold: 0.9N; sprint cutoff: 900.
-- LCB `z`: 0.3 → 0.8 as capacity remains high.
-- “Nearly met” buffer: 20.
+- Probabilities for neither: 60%/40%/25%/12% by admitted count thresholds (300/700/900).
+- Single‑attr safety margin cutoffs: −5, 10, 20.
+- Priors: `p_young = p_wd = 0.3225`.
+- LCB `z` schedule: `0.3 + 0.5 * remaining_fraction`.
 
 Edge Cases
-- If only one constraint present, accept if person has it or it’s already met.
-- When `R <= 1`, neither/wrong‑side safety checks return False (don’t risk infeasibility).
+- If only one constraint exists, accept if the person has it or it’s already met.
+- When `R <= 1`, `_safe_accept_neither` returns False.
 
 Code
-- Source: `scenario1.py` (`decide`, `_adjusted_p`, `_safe_wrong_side_accept`, `_safe_accept_neither`).
-
+- Source: `scenario1.py` (`decide`, `_adjusted_p`, `_safe_accept_neither`).

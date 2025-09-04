@@ -150,11 +150,22 @@ def get_dynamic_score_adjustment(person: Dict[str, bool], state) -> float:
 
 
 def _dynamic_threshold(state, base: float = BASE_THRESHOLD_SCENARIO2) -> float:
-    """Base threshold modulation from state only."""
+    """Base threshold modulation from state only.
+
+    More aggressive early phase until creative reaches 85% of its minimum
+    (lower acceptance threshold broadly to speed initial progress).
+    """
     if _all_minima_met(state):
         return 0.0
     bl_prog = _progress(state, A_B)
     cr_prog = _progress(state, A_C)
+
+    # Early-phase: be much more permissive until creatives reach 85%
+    if cr_prog < 0.85:
+        # Lower the global threshold substantially in the beginning
+        return max(1.0, base - 1.5)
+
+    # If both BL and CR are lagging moderately, still ease a bit
     if bl_prog < 0.7 and cr_prog < 0.7:
         return max(2.0, base - 0.3)
     return base
@@ -162,14 +173,14 @@ def _dynamic_threshold(state, base: float = BASE_THRESHOLD_SCENARIO2) -> float:
 
 def _threshold_for(person: Dict[str, bool], state) -> float:
     """Person-aware threshold shaping:
-    - Auto-accept creatives until they hit 95% of their minimum (handled in decide).
-    - After creatives reach 95%, ease threshold by 0.5 for creative candidates
+    - Auto-accept creatives until they hit 85% of their minimum (handled in decide).
+    - After creatives reach 85%, ease threshold by 0.5 for creative candidates
       to continue favoring them without auto-accepting.
     """
     thr = _dynamic_threshold(state)
     if person.get(A_C, False):
         cr_prog = _progress(state, A_C)
-        if cr_prog >= 0.95:
+        if cr_prog >= 0.85:
             thr = max(1.5, thr - 0.5)
     return thr
 
@@ -187,9 +198,9 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     if _remaining(state) <= ENDGAME_REMAINING and not _feasible_if_accept(person, state):
         return False
 
-    # 3.5) Creative auto-accept until 95% of minimum is reached
+    # 3.5) Creative auto-accept until 85% of minimum is reached
     if person.get(A_C, False):
-        if _progress(state, A_C) < 0.95:
+        if _progress(state, A_C) < 0.85:
             return True
 
     # 4) Curated 16-combo score + dynamic adjustment

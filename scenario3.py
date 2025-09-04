@@ -109,6 +109,16 @@ def _need_map(state: Any) -> Dict[str, int]:
     return {a: max(0, state.constraints[a] - state.counts.get(a, 0)) for a in state.constraints}
 
 
+def _progress(state: Any, attr: str) -> float:
+    """Progress toward meeting the minimum for a given attribute.
+    Returns ratio in [0, inf) where 1.0 means the minimum is met.
+    """
+    m = int(state.constraints.get(attr, 0))
+    if m <= 0:
+        return 1.0
+    return float(state.counts.get(attr, 0)) / float(m)
+
+
 def _all_constraints_met(state: Any) -> bool:
     for a, M_a in state.constraints.items():
         if state.counts.get(a, 0) < M_a:
@@ -185,15 +195,22 @@ def _dynamic_threshold(state: Any) -> float:
     max_ratio = max(gs_ratio, int_ratio, qf_ratio)
 
     if max_ratio >= 0.95:
-        return 35.0  # Super desperate
+        thr = 35.0  # Super desperate
     elif max_ratio >= 0.85:
-        return 40.0  # Very desperate
+        thr = 40.0  # Very desperate
     elif max_ratio >= 0.75:
-        return 45.0  # Desperate
+        thr = 45.0  # Desperate
     elif max_ratio >= 0.60:
-        return 50.0  # Concerned
+        thr = 50.0  # Concerned
     else:
-        return 55.0  # Comfortable
+        thr = 55.0  # Comfortable
+
+    # Early-phase aggressiveness: be more permissive globally until QF reaches 90%
+    qf_prog = _progress(state, "queer_friendly")
+    if qf_prog < 0.90:
+        thr = min(thr, 40.0)
+
+    return thr
 
 
 def decide(person: Dict[str, bool], state: Any, rejection_history: List[int]) -> bool:
@@ -218,6 +235,10 @@ def decide(person: Dict[str, bool], state: Any, rejection_history: List[int]) ->
     # Score lookup
     key = _person_to_key(person)
     score = _SCORES[key]
+
+    # Early auto-accept: favor QF strongly until reaching 90% of its minimum
+    if person.get("queer_friendly", False) and _progress(state, "queer_friendly") < 0.90:
+        return True
 
     # Dynamic thresholding (0–100 scale)
     threshold = _dynamic_threshold(state)

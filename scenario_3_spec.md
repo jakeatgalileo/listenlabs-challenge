@@ -1,56 +1,46 @@
-# Scenario 3 — Spec: 64‑Combo Scoring + Dynamic Threshold
+# Scenario 3 — Spec: 64‑Combo Scoring + Need‑Ratio Threshold
 
-Goal: Precompute a score for every combination of the six attributes, then accept using a dynamic threshold that adapts to constraint health and progress, while preserving hard safety and conservative endgame feasibility.
+Goal: Use a curated score table over all 64 combinations of six attributes and accept based on a dynamic threshold driven by need ratios for key constraints, while preserving hard safety and a conservative endgame feasibility check.
 
 Attributes and Order
-
-- Order (bit/tuple): `(underground_veteran, international, fashion_forward, queer_friendly, vinyl_collector, german_speaker)`.
+- Bit/tuple order: `(underground_veteran, international, fashion_forward, queer_friendly, vinyl_collector, german_speaker)`.
 
 Inputs/State
-
-- `person`, `state` (`N`, `admitted_count`, `counts`, `constraints`, `freqs`, `corr`).
+- `person`, `state` (`N`, `admitted_count`, `counts`, `constraints`, `freqs`).
 
 Invariants & Guards
-
-- Hard safety: if the candidate lacks a currently critical attribute and `R-1 < need[a]` for any `a`, reject.
-- Accept‑all once all minima are satisfied (minimize rejections).
-- Endgame feasibility (R ≤ 120): reject if `cur + (R-1)*p[a] < M[a]` for any `a` after accepting the candidate.
+- Hard safety: if the candidate lacks a critical attribute and `R-1 < need[a]` for any `a`, reject.
+- Accept‑all once all minima are satisfied.
+- Endgame feasibility (R ≤ 120): reject if, after accepting, `cur + (R-1)*p[a] < M[a]` for any `a`.
 
 Precomputed Scores (64 combos)
+- `SCORING_MAP` assigns explicit scores on a 0–100 scale for many meaningful combinations; unspecified combos default to `0.0`.
+- Emphasis patterns in the current map (see `scenario3.py`):
+  - High scores for sets combining `german_speaker` and `international`, especially when paired with `queer_friendly` and other supportive traits.
+  - QF with either GS or INT receives solid scores; GS‑only or INT‑only also score moderately to recover lagging constraints.
+  - Low scores for already‑met/low‑value traits and for “no useful attributes”.
 
-- Base weight per attribute: `W[a] = clamp((minRate[a] / baseRate[a]), 0.8, 6.0)` computed from `constraints` and `freqs`.
-- Combination bonuses/penalties:
-  - `+6.0 + 2.0*max(0,c_qf,vc)` if QF∧VC (rare, positively correlated).
-  - `+1.5 + 1.0*max(0, -c_intl,gs)` if GS∧¬INTL (exploit strong negative INTL–GS correlation).
-  - `+0.5 + 0.5*max(0, c_intl,ff)` if INTL∧FF.
-  - `−1.0 − 0.5*max(0, -c_intl,gs)` if INTL∧GS together (competing signals).
-  - `+1.0` if ≥4 attributes true and includes at least one rare (QF or VC).
-- Always‑accept tier: any combo with QF∧VC is clamped to score ≥ 10.0.
-
-Dynamic Threshold
-
-- `threshold = base_threshold * f(constraint_health) * g(progress)` where:
-  - `constraint_health`: For each `a`, project `expected_final = (count[a]/admitted)*N`, then `health[a] = expected_final/min[a]`. If `min(health) < 0.9`, scale threshold by `(0.7 + 0.3*min_health)`.
-  - `progress`: If progress > 0.8, multiply threshold by 1.2; if < 0.3, multiply by 0.9.
-- Default `base_threshold = 3.0`.
-- Early strict phase: until either QF or VC reaches ~80% of its minimum, clamp threshold to ≥ 8.5 for non‑QF/VC sets so we strongly bias toward QF or VC early. Once `max(QF_fill, VC_fill) ≥ 0.8`, normal thresholding resumes.
+Dynamic Threshold (0–100 scale)
+- Compute need ratios over remaining seats for `german_speaker`, `international`, and a discounted `queer_friendly`:
+  - `ratio = need[a] / remaining` (QF ratio divided by 3 to account for heavier scoring weight).
+- Threshold levels by max ratio:
+  - ≥ 0.95 → 35 (super desperate)
+  - ≥ 0.85 → 40 (very desperate)
+  - ≥ 0.75 → 45 (desperate)
+  - ≥ 0.60 → 50 (concerned)
+  - else → 55 (comfortable)
 
 Decision Flow
-
-1. Hard safety check → reject if violated.
-2. If all minima met → accept.
+1. Hard safety → reject if violated.
+2. All minima met → accept all.
 3. If `R ≤ 120` and accepting breaks feasibility → reject.
-4. Compute combo key and lookup score.
-5. If candidate has QF or VC → accept (after safety/feasibility guards).
-6. Else, if `score ≥ 8.5` (always‑accept tier) → accept.
-7. Else, compute dynamic threshold; accept iff `score ≥ threshold`.
+4. Lookup the 6‑bit combo key and get the precomputed score.
+5. Accept if `score ≥ threshold` (no special auto‑accept tiers in code).
 
 Tuning Guidance
-
-- If rejections are high and minima are met early, raise `base_threshold` slightly (more selective late).
-- If critical constraints lag, lower `base_threshold` or strengthen specific bonuses (e.g., GS∧¬INTL).
-- To force more GS, add a small global `+0.3` to any combo with GS.
+- Adjust `SCORING_MAP` entries to reprioritize combinations.
+- If too many rejects late, lower the threshold breakpoints (e.g., −5 across tiers).
+- If a constraint lags, increase scores for combos that include that attribute (e.g., add +3–5 to all GS combos).
 
 Code
-
-- Source: `scenario3.py` (`decide`), with helpers for keys, scores, and dynamic threshold.
+- Source: `scenario3.py` (`decide`), helpers: `_person_to_key`, `_tuple_to_key`, `_build_scores`, `_dynamic_threshold`, plus safety/feasibility utilities.
