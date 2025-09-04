@@ -1,18 +1,22 @@
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 
 """
-Scenario 2: Creative-first with B emphasis.
+Scenario 2: Curated 16‑combo scoring + dynamic adjustments.
 
-Implements:
-- Hard safety to avoid infeasibility.
-- Priority ordering: accept creative (always); then accept B∧T when required overlap is
-  positive; accept single B/T only if the other remains feasible.
-- Moderate endgame guard at R ≤ 80 using a conservative feasibility check.
-- Scoring fallback: scarcity-weighted with explicit B∧T synergy and light
-  correlation bonus; adaptive threshold from recent rejection rate and deficits.
- - Strict W gating: reject W unless paired with B or C (i.e., reject W-only and W+T-only).
- - Creatives: auto-accept only until 95% of min; after that, treat as normal unless they also carry B/T.
+Goal: Prioritize `creative` (rare, critical) and `berlin_local` (most constrained),
+while respecting the strong negative correlation between `berlin_local` and
+`techno_lover`, and exploiting the positive correlation between `berlin_local`
+and `well_connected`.
+
+Approach:
+- Hard safety guard to prevent infeasibility.
+- Curated score for all 16 (TL, WC, CR, BL) combinations.
+- Dynamic score adjustments based on current progress toward minima.
+- Simple dynamic threshold (base 2.5), optionally tunable.
+- Endgame feasibility guard when nearing capacity.
+
+Tuning guidance is documented in scenario_2_spec.md and mirrored in comments below.
 """
 
 # Attribute ids used by the API
@@ -21,26 +25,64 @@ A_W = "well_connected"
 A_C = "creative"
 A_B = "berlin_local"
 
-# Tunables (chosen per analysis):
-ENDGAME_REMAINING = 80        # conservative finishing window
-SCARCITY_CLIP = 5.0
-UNION_MARGIN_FRAC = 0.10      # slack fraction for B∧T union feasibility
-UNION_MARGIN_MIN = 8
-BONUS_CREATIVE_AUTO_RATIO = 0.95  # auto-accept creatives until 95% of min
-B_STRUGGLE_RATIO = 0.95       # treat B as struggling until 95%
-T_STRUGGLE_RATIO = 0.93       # slightly higher to accept more T
-SINGLE_ACCEPT_SLACK = 0.05    # 5% slack on feasibility for single-attr B/T admits
+# Attribute order for keys in the curated map (TL, WC, CR, BL)
+ATTR_ORDER: Tuple[str, str, str, str] = (A_T, A_W, A_C, A_B)
+
+# Thresholds / guards
+BASE_THRESHOLD_SCENARIO2 = 2.5
+ALWAYS_ACCEPT_CUTOFF = 9.5  # Tier 1 gets 10.0; accept immediately
+ENDGAME_REMAINING = 80      # conservative finishing window
+
+
+# Curated scoring map (current state)
+# Attribute order: (techno_lover, well_connected, creative, berlin_local)
+# Format: (TL, WC, CR, BL): score
+SCORING_MAP_SCENARIO2: Dict[Tuple[bool, bool, bool, bool], float] = {
+    # TIER 1: ALWAYS ACCEPT (Score 10.0)
+    # Has creative (rare) + berlin_local (critical)
+    (True, True, True, True): 10.0,   # All attributes (ultra rare due to correlations)
+    (True, False, True, True): 10.0,  # CR+BL+TL (rare combo)
+    (False, True, True, True): 10.0,  # CR+BL+WC (excellent combo)
+    (False, False, True, True): 10.0, # CR+BL only
+
+    # TIER 2: VERY HIGH PRIORITY (Score 8.0-9.0)
+    # Creative with other helpful attributes
+    (True, True, True, False): 9.0,   # CR+TL+WC (no BL)
+    (True, False, True, False): 8.5,  # CR+TL only
+    (False, True, True, False): 8.5,  # CR+WC only
+    (False, False, True, False): 8.0, # CR only (still very valuable)
+
+    # Berlin local + techno_lover (fighting the negative correlation)
+    (True, True, False, True): 8.0,   # BL+TL+WC (all constraints)
+    (True, False, False, True): 8.0,  # BL+TL (rare due to -0.655 correlation)
+
+    # TIER 3: HIGH PRIORITY (Score 5.0-7.0)
+    # Berlin local combinations (exploiting positive correlations)
+    (False, True, False, True): 7.0,  # BL+WC (positive correlation +0.572)
+    (False, False, False, True): 5.5, # BL only
+
+    # TIER 4: MEDIUM PRIORITY (Score 2.5-4.0)
+    # Techno_lover combinations (common but needed)
+    (True, True, False, False): 3.0,  # TL+WC (negative correlation -0.470)
+    (True, False, False, False): 3.5, # TL only (common, helps constraint)
+
+    # TIER 5: LOW PRIORITY (Score 1.0-2.0)
+    # Well_connected only
+    (False, True, False, False): 2.0, # WC only
+
+    # TIER 6: REJECT (Score 0.0)
+    (False, False, False, False): 0.0, # No attributes
+}
 
 
 def _remaining(state) -> int:
     return max(0, state.N - state.admitted_count)
 
 
-def _need_map(state) -> Dict[str, int]:
-    return {a: max(0, state.constraints[a] - state.counts.get(a, 0)) for a in state.constraints}
-
-
 def _hard_safety(person: Dict[str, bool], state) -> bool:
+    """If this person lacks some attribute `a` and admitting them would
+    leave fewer than the remaining required seats to still satisfy `a`,
+    then we must reject them (unsafe)."""
     R = _remaining(state)
     for a, M_a in state.constraints.items():
         if not person.get(a, False) and (R - 1) < max(0, M_a - state.counts.get(a, 0)):
@@ -48,7 +90,9 @@ def _hard_safety(person: Dict[str, bool], state) -> bool:
     return True
 
 
-def _endgame_feasible(person: Dict[str, bool], state) -> bool:
+def _feasible_if_accept(person: Dict[str, bool], state) -> bool:
+    """Conservative feasibility check: after accepting this person, can we
+    still reach each minimum under expected frequencies?"""
     R = _remaining(state)
     for a, M_a in state.constraints.items():
         cur = state.counts.get(a, 0) + (1 if person.get(a, False) else 0)
@@ -58,176 +102,104 @@ def _endgame_feasible(person: Dict[str, bool], state) -> bool:
     return True
 
 
-def _adaptive_threshold(state, rejection_history: List[int]) -> float:
-    progress = (state.admitted_count / state.N) if state.N else 0.0
-    base = 0.45 * (1.0 - progress)
-    # Pressure from deficits
-    pressure = 0.0
-    for a, M_a in state.constraints.items():
-        if a == A_W:
-            continue
-        req = (M_a / state.N) if state.N else 0.0
-        cur_rate = state.counts.get(a, 0) / max(1, state.admitted_count)
-        pressure = max(pressure, req - cur_rate)
-    # Recent rejection rate modulation
-    if rejection_history:
-        window = rejection_history[-min(100, len(rejection_history)) :]
-        rej_rate = sum(window) / len(window)
-        if rej_rate > 0.85:
-            base *= 0.8
-        elif rej_rate > 0.7:
-            base *= 0.9
-        elif rej_rate < 0.25 and pressure > 0.1:
-            base *= 1.15
-    return base + pressure
+def _all_minima_met(state) -> bool:
+    for a, m in state.constraints.items():
+        if state.counts.get(a, 0) < m:
+            return False
+    return True
 
 
-def _overlap_needed(need: Dict[str, int], R: int) -> int:
-    # Required overlap between B and T to fit both in remaining R seats
-    b = need.get(A_B, 0)
-    t = need.get(A_T, 0)
-    return max(0, b + t - R)
+def _person_to_key(person: Dict[str, bool]) -> Tuple[bool, bool, bool, bool]:
+    return tuple(bool(person.get(a, False)) for a in ATTR_ORDER)  # type: ignore[return-value]
+
+
+def _progress(state, a: str) -> float:
+    m = max(1, int(state.constraints.get(a, 1)))
+    return state.counts.get(a, 0) / m
+
+
+def get_dynamic_score_adjustment(person: Dict[str, bool], state) -> float:
+    """Adjust scores based on current progress toward constraints.
+
+    Spec highlights:
+    - Boost lagging constraints: BL (+1.5) and CR (+2.0) when < 70% to min.
+    - Special boost for rare BL∧TL (+1.0) to fight negative correlation.
+    - Penalty for over-represented TL‑only when TL progress > 90%.
+    """
+    adj = 0.0
+
+    bl_prog = _progress(state, A_B)
+    cr_prog = _progress(state, A_C)
+    tl_prog = _progress(state, A_T)
+    # wc_prog = _progress(state, A_W)  # not directly used, kept for tuning
+
+    if person.get(A_B) and bl_prog < 0.7:
+        adj += 1.5
+    if person.get(A_C) and cr_prog < 0.7:
+        adj += 2.0
+
+    # Rare BL ∧ TL combo boost
+    if person.get(A_B) and person.get(A_T):
+        adj += 1.0
+
+    # TL‑only penalty when TL is already well on track and no BL
+    if person.get(A_T) and not person.get(A_B) and tl_prog > 0.9:
+        adj -= 1.0
+
+    return adj
+
+
+def _dynamic_threshold(state, base: float = BASE_THRESHOLD_SCENARIO2) -> float:
+    """Base threshold modulation from state only."""
+    if _all_minima_met(state):
+        return 0.0
+    bl_prog = _progress(state, A_B)
+    cr_prog = _progress(state, A_C)
+    if bl_prog < 0.7 and cr_prog < 0.7:
+        return max(2.0, base - 0.3)
+    return base
+
+
+def _threshold_for(person: Dict[str, bool], state) -> float:
+    """Person-aware threshold shaping:
+    - Auto-accept creatives until they hit 95% of their minimum (handled in decide).
+    - After creatives reach 95%, ease threshold by 0.5 for creative candidates
+      to continue favoring them without auto-accepting.
+    """
+    thr = _dynamic_threshold(state)
+    if person.get(A_C, False):
+        cr_prog = _progress(state, A_C)
+        if cr_prog >= 0.95:
+            thr = max(1.5, thr - 0.5)
+    return thr
 
 
 def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool:
-    # 1) Hard safety
+    # 1) Hard safety guard
     if not _hard_safety(person, state):
         return False
 
-    R = _remaining(state)
-    need = _need_map(state)
-    # Track creative progress for gating and correlation handling
-    minC = max(1, int(state.constraints.get(A_C, 1)))
-    ratioC = state.counts.get(A_C, 0) / minC
-
-    # 2) Creatives: auto-accept only until 95% of min
-    if person.get(A_C, False):
-        if ratioC < BONUS_CREATIVE_AUTO_RATIO:
-            return True
-
-    # 2.5) Strict W gating per strategy: only accept W when paired with B or C
-    has_B = bool(person.get(A_B, False))
-    has_T = bool(person.get(A_T, False))
-    has_W = bool(person.get(A_W, False))
-    if has_W and not (has_B or person.get(A_C, False)):
-        return False
-
-    # 3) Moderate endgame guard (reject only if infeasible)
-    if R <= ENDGAME_REMAINING and not _endgame_feasible(person, state):
-        return False
-
-    # 3) Reconcile B vs T via overlap priority and union control
-    need_B = need.get(A_B, 0)
-    need_T = need.get(A_T, 0)
-
-    # Current fulfillment ratios
-    minB = max(1, int(state.constraints.get(A_B, 1)))
-    minT = max(1, int(state.constraints.get(A_T, 1)))
-    ratioB = (state.counts.get(A_B, 0) / minB)
-    ratioT = (state.counts.get(A_T, 0) / minT)
-
-    # Union feasibility metric U = (need_B + need_T - R)
-    U = (need_B + need_T) - R
-    union_margin = max(UNION_MARGIN_MIN, int(UNION_MARGIN_FRAC * R))
-
-    # If union pressure is high (U >= margin), only overlapped B∧T helps; reject others
-    if U >= union_margin:
-        return bool(has_B and has_T)
-
-    overlap_req = _overlap_needed(need, R)
-    if has_B and has_T and (overlap_req > 0 or (U < union_margin and (ratioB < 1.0 or ratioT < 1.0))):
+    # 2) If all minima already met, accept everyone to finish with minimal rejections
+    if _all_minima_met(state):
         return True
 
-    # W-only and W+T-only were already rejected by strict W gating above
+    # 3) Endgame feasibility guard
+    if _remaining(state) <= ENDGAME_REMAINING and not _feasible_if_accept(person, state):
+        return False
 
-    # 4) Single-attribute admits only if the other remains feasible
-    pB = max(0.0, state.freqs.get(A_B, 0.0))
-    pT = max(0.0, state.freqs.get(A_T, 0.0))
-
-    if has_B and not has_T and need_B > 0:
-        # If T is already safe or fulfilled, lean into B
-        if ratioT >= 0.95 and U < union_margin:
-            return True
-        # Allow slight slack on T feasibility to keep B moving
-        if ((R - 1) * pT) >= (need_T * (1.0 - SINGLE_ACCEPT_SLACK)) and U <= 0:
+    # 3.5) Creative auto-accept until 95% of minimum is reached
+    if person.get(A_C, False):
+        if _progress(state, A_C) < 0.95:
             return True
 
-    if has_T and not has_B and need_T > 0:
-        # If B is already safe or fulfilled, lean into T
-        if ratioB >= 0.95 and U < union_margin:
-            return True
-        if ((R - 1) * pB) >= (need_B * (1.0 - SINGLE_ACCEPT_SLACK)) and U <= 0:
-            return True
+    # 4) Curated 16-combo score + dynamic adjustment
+    key = _person_to_key(person)
+    base_score = SCORING_MAP_SCENARIO2.get(key, 0.0)
 
-    # (Removed) C-only avoidance and creative reservation – creatives are always accepted above
+    # Tier-1: accept immediately
+    if base_score >= ALWAYS_ACCEPT_CUTOFF:
+        return True
 
-    # 6.5) Auto-accept struggling attributes for B/T only (with guards)
-    ratios: Dict[str, float] = {
-        A_B: (state.counts.get(A_B, 0) / max(1, state.constraints.get(A_B, 1))),
-        A_T: (state.counts.get(A_T, 0) / max(1, state.constraints.get(A_T, 1))),
-    }
-    struggling = set()
-    for a, r in ratios.items():
-        thr = B_STRUGGLE_RATIO if a == A_B else T_STRUGGLE_RATIO
-        if r < thr:
-            struggling.add(a)
-    if U < union_margin and struggling:
-        # Priority: B/T (respect other-attr feasibility). C is handled earlier.
-        # B-only struggling
-        if (A_B in struggling) and has_B and not has_T:
-            if (R - 1) * pT >= need_T:
-                return True
-        # T-only struggling
-        if (A_T in struggling) and has_T and not has_B:
-            if (R - 1) * pB >= need_B:
-                return True
-        # B∧T always helps when struggling and not union-critical
-        if (A_B in struggling or A_T in struggling) and has_B and has_T:
-            return True
-        # Note: Do not auto-accept W on struggle; it fills naturally.
-
-    # 6) Scoring fallback with scarcity and synergy (B and T weighted higher)
-    scarcity: Dict[str, float] = {}
-    for a in state.constraints:
-        p = max(1e-6, state.freqs.get(a, 0.0))
-        scarcity[a] = min(SCARCITY_CLIP, need[a] / max(1.0, R * p)) if R > 0 else (10.0 if need[a] > 0 else 0.0)
-
-    s = 0.0
-    # B weighted highest, then T, then W. C is auto-accepted above.
-    if has_B:
-        s += 1.8 * (1.0 + 2.6 * scarcity.get(A_B, 0.0))
-    else:
-        if need_B > 0:
-            s -= 0.7 * (1.0 + 1.3 * scarcity.get(A_B, 0.0))
-    if has_T:
-        s += 1.0 * (1.0 + 1.4 * scarcity.get(A_T, 0.0))
-    else:
-        if need_T > 0:
-            s -= 0.35 * (1.0 + 1.0 * scarcity.get(A_T, 0.0))
-    # Ignore W in scoring entirely; gating handles its effect.
-
-    # Explicit synergy bonus when both B and T present
-    if has_B and has_T:
-        s += 2.3
-
-    # Light correlation bonus toward unmet, scarcity-weighted needs
-    for a_true, v in person.items():
-        if not v:
-            continue
-        # After creatives reach 95%, ignore correlation credit from C to avoid over-accepting C-only
-        if a_true == A_C and ratioC >= BONUS_CREATIVE_AUTO_RATIO:
-            continue
-        # Only consider correlation toward unmet B/T
-        for a_need in (A_B, A_T):
-            if need.get(a_need, 0) <= 0:
-                continue
-            c = float(state.corr.get(a_true, {}).get(a_need, 0.0))
-            if c > 0.0:
-                s += 0.12 * c * (1.0 + 0.6 * scarcity.get(a_need, 0.0))
-
-    # If union is tight, penalize candidates lacking both B and T
-    if -union_margin <= U < union_margin and not (has_B or has_T):
-        s -= 0.5
-
-    threshold = _adaptive_threshold(state, rejection_history)
-    return s >= threshold
+    score = base_score + get_dynamic_score_adjustment(person, state)
+    threshold = _threshold_for(person, state)
+    return score >= threshold

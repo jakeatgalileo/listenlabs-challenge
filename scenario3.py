@@ -1,26 +1,122 @@
-from typing import Dict, List
+from typing import Any, Dict, List, Tuple, Optional
 
 
-# Scenario 3: correlation-aware strategy with scarcity-weighted scoring
-# and dynamic thresholding. Standalone (no imports from bouncer).
+# Scenario 3: Precomputed 64-combo scoring with dynamic thresholding.
+# Standalone (no imports from bouncer).
+
+ATTR_ORDER: Tuple[str, ...] = (
+    "underground_veteran",
+    "international",
+    "fashion_forward",
+    "queer_friendly",
+    "vinyl_collector",
+    "german_speaker",
+)
+
+_ATTR_INDEX: Dict[str, int] = {a: i for i, a in enumerate(ATTR_ORDER)}
+
+# Cached scores per game (lazy init)
+_SCORES: Optional[List[float]] = None
+
+"""
+Granular scoring map (0–100 scale), keyed by
+(UV, INT, FF, QF, VC, GS) in that order, matching ATTR_ORDER.
+"""
+SCORING_MAP: Dict[Tuple[bool, bool, bool, bool, bool, bool], float] = {
+    # CRITICAL: Must have both INT and GS (fight -0.72 correlation)
+    (True, True, True, True, True, True): 100.0,   # Perfect person
+    (False, True, False, True, False, True): 95.2, # QF+GS+INT (helps all 3 critical)
+    (False, True, True, True, False, True): 94.8,  # QF+GS+INT+FF (helps all 4 remaining)
+    (True, True, False, True, False, True): 93.6,  # QF+GS+INT+UV
+    (True, True, True, True, False, True): 93.1,   # QF+GS+INT+UV+FF
+
+    # Has both GS+INT but no QF (still critical for the correlation fight)
+    (True, True, True, False, False, True): 82.3,  # GS+INT+UV+FF
+    (True, True, False, False, False, True): 78.7, # GS+INT+UV
+    (False, True, True, False, False, True): 79.4, # GS+INT+FF
+    (False, True, False, False, False, True): 76.2,# GS+INT only
+
+    # QF with either GS or INT (not both due to correlation)
+    (True, False, True, True, True, True): 71.3,   # QF+GS+others (no INT)
+    (False, False, True, True, True, True): 70.8,  # QF+GS+FF+VC
+    (True, False, False, True, True, True): 68.9,  # QF+GS+UV+VC
+    (True, False, True, True, False, True): 67.4,  # QF+GS+UV+FF
+    (True, False, False, True, False, True): 64.2, # QF+GS+UV
+    (False, False, True, True, False, True): 63.7, # QF+GS+FF
+    (False, False, False, True, True, True): 62.1, # QF+GS+VC
+    (False, False, False, True, False, True): 58.9,# QF+GS only
+
+    (True, True, True, True, True, False): 69.8,   # QF+INT+others (no GS)
+    (False, True, True, True, True, False): 69.2,  # QF+INT+FF+VC
+    (True, True, False, True, True, False): 67.6,  # QF+INT+UV+VC
+    (True, True, True, True, False, False): 66.1,  # QF+INT+UV+FF
+    (True, True, False, True, False, False): 62.8, # QF+INT+UV
+    (False, True, True, True, False, False): 62.3, # QF+INT+FF
+    (False, True, False, True, True, False): 60.4, # QF+INT+VC
+    (False, True, False, True, False, False): 57.2,# QF+INT only
+
+    # GS without QF or INT (still critical - need 100% of remaining!)
+    (True, False, True, False, True, True): 48.6,  # GS+UV+FF+VC
+    (True, False, True, False, False, True): 46.3,  # GS+UV+FF
+    (True, False, False, False, True, True): 44.7,  # GS+UV+VC
+    (True, False, False, False, False, True): 42.1, # GS+UV
+    (False, False, True, False, True, True): 43.8,  # GS+FF+VC
+    (False, False, True, False, False, True): 41.4, # GS+FF
+    (False, False, False, False, True, True): 39.2, # GS+VC
+    (False, False, False, False, False, True): 36.8,# GS only
+
+    # INT without QF or GS (still critical - need 100% of remaining!)
+    (True, True, True, False, True, False): 47.9,   # INT+UV+FF+VC
+    (True, True, True, False, False, False): 45.7,  # INT+UV+FF
+    (True, True, False, False, True, False): 43.2,  # INT+UV+VC
+    (True, True, False, False, False, False): 41.3, # INT+UV
+    (False, True, True, False, True, False): 42.6,  # INT+FF+VC
+    (False, True, True, False, False, False): 40.9, # INT+FF
+    (False, True, False, False, True, False): 37.4, # INT+VC
+    (False, True, False, False, False, False): 35.1,# INT only
+
+    # QF without GS or INT (still valuable - need 18% of remaining)
+    (True, False, True, True, True, False): 28.7,   # QF+UV+FF+VC
+    (True, False, True, True, False, False): 26.3,  # QF+UV+FF
+    (True, False, False, True, True, False): 24.1,  # QF+UV+VC
+    (True, False, False, True, False, False): 21.8, # QF+UV
+    (False, False, True, True, True, False): 23.4,  # QF+FF+VC
+    (False, False, True, True, False, False): 20.9, # QF+FF
+    (False, False, False, True, True, False): 18.6, # QF+VC
+    (False, False, False, True, False, False): 16.2,# QF only
+
+    # Fashion forward combinations (need 8% of remaining)
+    (True, False, True, False, True, False): 11.3,  # FF+UV+VC
+    (True, False, True, False, False, False): 8.7,  # FF+UV
+    (False, False, True, False, True, False): 7.2,  # FF+VC
+    (False, False, True, False, False, False): 4.9, # FF only
+
+    # Already met constraints (UV, VC) - low priority
+    (True, False, False, False, True, False): 3.8,  # UV+VC
+    (True, False, False, False, False, False): 2.1, # UV only
+    (False, False, False, False, True, False): 1.4, # VC only
+
+    # No useful attributes
+    (False, False, False, False, False, False): 0.0, # Nothing
+}
 
 
-def _remaining(state) -> int:
+def _remaining(state: Any) -> int:
     return max(0, state.N - state.admitted_count)
 
 
-def _need_map(state) -> Dict[str, int]:
+def _need_map(state: Any) -> Dict[str, int]:
     return {a: max(0, state.constraints[a] - state.counts.get(a, 0)) for a in state.constraints}
 
 
-def _all_constraints_met(state) -> bool:
+def _all_constraints_met(state: Any) -> bool:
     for a, M_a in state.constraints.items():
         if state.counts.get(a, 0) < M_a:
             return False
     return True
 
 
-def _hard_safety(person: Dict[str, bool], state) -> bool:
+def _hard_safety(person: Dict[str, bool], state: Any) -> bool:
     R = _remaining(state)
     for a, M_a in state.constraints.items():
         if not person.get(a, False) and (R - 1) < max(0, M_a - state.counts.get(a, 0)):
@@ -28,7 +124,7 @@ def _hard_safety(person: Dict[str, bool], state) -> bool:
     return True
 
 
-def _feasible(person: Dict[str, bool], state) -> bool:
+def _feasible_if_accept(person: Dict[str, bool], state: Any) -> bool:
     R = _remaining(state)
     for a, M_a in state.constraints.items():
         cur = state.counts.get(a, 0) + (1 if person.get(a, False) else 0)
@@ -38,348 +134,93 @@ def _feasible(person: Dict[str, bool], state) -> bool:
     return True
 
 
-def _expected_value(person: Dict[str, bool], state, horizon: int) -> float:
-    R = _remaining(state)
-    H = min(horizon, R)
-    need = _need_map(state)
-    direct = 0.0
-    for a in state.constraints:
-        if person.get(a, False) and need[a] > 0:
-            direct += 1.0 / max(1, need[a])
+def _person_to_key(person: Dict[str, bool]) -> int:
+    key = 0
+    for i, attr in enumerate(ATTR_ORDER):
+        if person.get(attr, False):
+            key |= (1 << i)
+    return key
 
-    opp_cost = 0.0
-    for a in state.constraints:
-        if not person.get(a, False) and need[a] > 0:
-            scarcity = 1.0 - max(0.0, min(1.0, state.freqs.get(a, 0.5)))
-            opp_cost += scarcity * (need[a] / max(1, R))
-
-    # Correlation lookahead (small weight)
-    corr_bonus = 0.0
-    for at, v in person.items():
-        if not v:
-            continue
-        for an in state.constraints:
-            if need[an] <= 0:
-                continue
-            c = state.corr.get(at, {}).get(an, 0.0)
-            if c > 0:
-                corr_bonus += 0.5 * c * max(0.0, state.freqs.get(an, 0.5)) * (need[an] / max(1, R))
-    return direct - opp_cost + 0.3 * corr_bonus
+def _tuple_to_key(t: Tuple[bool, bool, bool, bool, bool, bool]) -> int:
+    key = 0
+    for i, v in enumerate(t):
+        if v:
+            key |= (1 << i)
+    return key
 
 
-def _scarcity_map(state) -> Dict[str, float]:
-    R = max(1, _remaining(state))
-    need = _need_map(state)
-    S: Dict[str, float] = {}
-    for a in state.constraints:
-        p = max(1e-6, state.freqs.get(a, 0.0))
-        S[a] = min(6.0, need[a] / max(1.0, R * p))
-    return S
-
-
-def _weights_required_over_base(state) -> Dict[str, float]:
-    """
-    Attribute weights ~ required rate / base rate, clipped.
-    Encourages rare-but-required attributes (qf, vc, gs, intl).
-    """
+def _weights_required_over_base(state: Any) -> Dict[str, float]:
     W: Dict[str, float] = {}
     for a, M_a in state.constraints.items():
         req = (M_a / state.N) if state.N else 0.0
-        p = max(1e-6, state.freqs.get(a, 0.0))
-        w = req / p if p > 0 else 5.0
+        p = max(1e-6, float(state.freqs.get(a, 0.0)))
+        w = (req / p) if p > 0 else 6.0
         W[a] = max(0.8, min(6.0, w))
     return W
 
 
-def _adaptive_threshold(state, rejection_history: List[int], base_start: float = 0.7, window: int = 100) -> float:
-    progress = (state.admitted_count / state.N) if state.N else 0.0
-    base = base_start * (1.0 - progress)
-
-    # Pressure from most lagging constraint
-    max_pressure = 0.0
-    for a, M_a in state.constraints.items():
-        req = (M_a / state.N) if state.N else 0.0
-        cur = state.counts.get(a, 0) / max(1, state.admitted_count)
-        max_pressure = max(max_pressure, req - cur)
-
-    if window > 0 and len(rejection_history) >= window:
-        recent = rejection_history[-window:]
-        rate = sum(recent) / window
-        if rate > 0.9:
-            base *= 0.8
-        elif rate > 0.8:
-            base *= 0.9
-        elif rate < 0.3 and max_pressure > 0.1:
-            base *= 1.15
-
-    return base + max_pressure
+def _build_scores(state: Any) -> List[float]:
+    # With the granular map we directly fill a 64-size array;
+    # unspecified combos default to 0.0 (very low priority).
+    scores = [0.0] * 64
+    for combo, val in SCORING_MAP.items():
+        scores[_tuple_to_key(combo)] = float(val)
+    return scores
 
 
-def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool:
-    # 1) Hard safety: never make feasibility impossible with one rejection
+def _dynamic_threshold(state: Any) -> float:
+    """Granular dynamic threshold on 0–100 scale.
+    Uses desperation ratios of GS/INT/QF relative to remaining slots.
+    """
+    remaining = max(1, state.N - state.admitted_count)
+
+    gs_need = max(0, int(state.constraints.get("german_speaker", 0)) - int(state.counts.get("german_speaker", 0)))
+    int_need = max(0, int(state.constraints.get("international", 0)) - int(state.counts.get("international", 0)))
+    qf_need = max(0, int(state.constraints.get("queer_friendly", 0)) - int(state.counts.get("queer_friendly", 0)))
+
+    gs_ratio = gs_need / remaining
+    int_ratio = int_need / remaining
+    qf_ratio = (qf_need / remaining) / 3.0  # QF 3x discounted due to rarity weighting
+
+    max_ratio = max(gs_ratio, int_ratio, qf_ratio)
+
+    if max_ratio >= 0.95:
+        return 35.0  # Super desperate
+    elif max_ratio >= 0.85:
+        return 40.0  # Very desperate
+    elif max_ratio >= 0.75:
+        return 45.0  # Desperate
+    elif max_ratio >= 0.60:
+        return 50.0  # Concerned
+    else:
+        return 55.0  # Comfortable
+
+
+def decide(person: Dict[str, bool], state: Any, rejection_history: List[int]) -> bool:
+    # Hard safety: if taking this seat without a critical attribute would make minima infeasible later, reject
     if not _hard_safety(person, state):
         return False
 
-    # 2) If all constraints are already met, accept-all to minimize rejections
+    # If all constraints are already met, accept-all to minimize rejections
     if _all_constraints_met(state):
         return True
 
+    # Endgame feasibility check: if accepting makes any target unattainable in expectation, reject
     R = _remaining(state)
-    need = _need_map(state)
-    scarcity = _scarcity_map(state)
-
-    # Promote rare categories while under minimum (subject to endgame feasibility)
-    qf = person.get("queer_friendly", False)
-    vc = person.get("vinyl_collector", False)
-    need_qf = need.get("queer_friendly", 0)
-    need_vc = need.get("vinyl_collector", 0)
-
-    # Padding: keep a small buffer for VC; do NOT pad QF (we target 100% first)
-    PAD_QF = 0.0
-    PAD_VC = 0.06  # 6% padding
-    from math import ceil
-    qf_min_padded = ceil(state.constraints.get("queer_friendly", 0) * (1.0 + PAD_QF))
-    vc_min_padded = ceil(state.constraints.get("vinyl_collector", 0) * (1.0 + PAD_VC))
-    qf_under_padded = state.counts.get("queer_friendly", 0) < qf_min_padded
-    vc_under_padded = state.counts.get("vinyl_collector", 0) < vc_min_padded
-
-    # Accept all vinyl_collectors while under their minimum (feasibility-guarded late).
-    if vc and (state.counts.get("vinyl_collector", 0) < state.constraints.get("vinyl_collector", 0)):
-        if R <= 120 and not _feasible(person, state):
-            return False
-        return True
-
-    # Auto-accept QF while under its minimum (not padded).
-    if qf and (state.counts.get("queer_friendly", 0) < state.constraints.get("queer_friendly", 0)):
-        if R <= 120 and not _feasible(person, state):
-            return False
-        return True
-    
-
-    # Overrepresentation guard for underground_veteran:
-    # If UGV is at/over min (or modestly over), only accept when they cover
-    # multiple current deficits (e.g., GS+INTL, QF+GS, etc.). This reduces
-    # UGV admits unless they strongly help remaining constraints.
-    ugv = person.get("underground_veteran", False)
-    if ugv:
-        ugv_need = need.get("underground_veteran", 0)
-        ugv_ratio = state.counts.get("underground_veteran", 0) / max(1, state.constraints.get("underground_veteran", 0))
-        if ugv_need <= 0 or ugv_ratio >= 1.05:
-            deficit_hits = 0
-            for a in ("queer_friendly", "vinyl_collector", "german_speaker", "international"):
-                if need.get(a, 0) > 0 and person.get(a, False):
-                    deficit_hits += 1
-            if deficit_hits < 2:
-                return False
-
-    # Phase 1 focus: push QF to 100% of min; pick up GS/INTL along the way
-    qf_ratio_min = state.counts.get("queer_friendly", 0) / max(1, state.constraints.get("queer_friendly", 0))
-    if qf_ratio_min < 1.0:
-        if qf:
-            if R <= 120 and not _feasible(person, state):
-                return False
-            return True
-        # General guidance: accept a few GS/INTL along the way (very sparingly)
-        # - Only allow BOTH GS and INTL together on an occasional trickle
-        gs_ratio_min = state.counts.get("german_speaker", 0) / max(1, state.constraints.get("german_speaker", 0))
-        intl_ratio_min = state.counts.get("international", 0) / max(1, state.constraints.get("international", 0))
-        has_gs = person.get("german_speaker", False)
-        has_intl = person.get("international", False)
-        TRICKLE_COMBO = 24
-        if need.get("german_speaker", 0) > 0 or need.get("international", 0) > 0:
-            # Occasional high-utility combo only
-            if has_gs and has_intl and (state.admitted_count % TRICKLE_COMBO == 0):
-                if R <= 120 and not _feasible(person, state):
-                    return False
-                return True
+    if R <= 120 and not _feasible_if_accept(person, state):
         return False
 
-    # 3) Reservation mode phases while qf/vc still below target for non-qf/vc
-    # Use padded-under flags for reservation/gating behavior
-    qf_under = qf_under_padded
-    vc_under = vc_under_padded
-    if qf_ratio_min < 0.9 and (qf_under or vc_under) and not (qf or vc):
-        # Compute fill ratios for qf/vc relative to their minima
-        def _ratio(attr: str) -> float:
-            if attr == "queer_friendly":
-                M = max(1, qf_min_padded)
-            elif attr == "vinyl_collector":
-                M = max(1, vc_min_padded)
-            else:
-                M = max(1, state.constraints.get(attr, 0))
-            return state.counts.get(attr, 0) / M
+    # Lazy-init static scores (once per game) on granular 0–100 scale
+    global _SCORES
+    if _SCORES is None:
+        _SCORES = _build_scores(state)
 
-        qf_ratio = _ratio("queer_friendly")
-        vc_ratio = _ratio("vinyl_collector")
-        focus_ratio = min(qf_ratio, vc_ratio)
-        # Stage 1: if focus_ratio < 0.5, be extremely selective:
-        # - Flat reject UGV/FF here unless they are also QF/VC (they aren't in this branch)
-        # - For everyone else, require BOTH german_speaker AND international
-        if focus_ratio < 0.5:
-            # Be stricter with underground_veteran; modestly stricter with fashion_forward.
-            gs_ok = person.get("german_speaker", False)
-            intl_ok = person.get("international", False)
-            ugv = person.get("underground_veteran", False)
-            ff = person.get("fashion_forward", False)
-            # Hard block overrepresented tracks early to reserve slots
-            if ugv or ff:
-                return False
-            # General gate for all other non-qf/vc
-            if not (gs_ok and intl_ok):
-                return False
-        # Stage 2: if 0.5 <= focus_ratio < 0.9, allow non-qf/vc only if they
-        # help any attribute that is < 90% of its minimum
-        elif focus_ratio < 0.9:
-            underfilled_90 = [
-                a for a, M in state.constraints.items()
-                if M > 0 and state.counts.get(a, 0) < 0.9 * M
-            ]
-            if not any(person.get(a, False) for a in underfilled_90):
-                return False
-            # If candidate is underground_veteran but doesn't help hard ones, reject
-            if person.get("underground_veteran", False):
-                if not (person.get("german_speaker", False) or person.get("international", False)):
-                    return False
-        # Stage 3: focus_ratio >= 0.9, fall through to normal scoring
+    # Score lookup
+    key = _person_to_key(person)
+    score = _SCORES[key]
 
-    # 4) Scarcity-aware early accept: take highly scarce contributors
-    # But when focus is strongly on qf/vc (<0.5), skip non-qf/vc here
-    general_criticality = 0.7
-    if not ((qf_under or vc_under) and not (qf or vc) and (min(
-        state.counts.get("queer_friendly", 0) / max(1, state.constraints.get("queer_friendly", 0)),
-        state.counts.get("vinyl_collector", 0) / max(1, state.constraints.get("vinyl_collector", 0)),
-    ) < 0.5)):
-        scarce_hits = [
-            scarcity[a]
-            for a in state.constraints
-            if person.get(a, False) and need[a] > 0
-        ]
-        if scarce_hits and max(scarce_hits) >= general_criticality:
-            return True
+    # Dynamic thresholding (0–100 scale)
+    threshold = _dynamic_threshold(state)
 
-    # 5) High-value correlation rules (qf-vc-gs synergy)
-    gs = person.get("german_speaker", False)
-
-    # Accept qf+vc combo if either is still needed (leverages 0.48 correlation)
-    if qf and vc and (need_qf > 0 or need_vc > 0):
-        return True
-
-    # Strong combos with german speaker when still needed
-    if (qf and gs) and (need_qf > 0 or need.get("german_speaker", 0) > 0):
-        return True
-    if (vc and gs) and (need_vc > 0 or need.get("german_speaker", 0) > 0):
-        return True
-
-    # Scarcity-priority for rare attrs
-    criticality = 0.75
-    if (qf and scarcity.get("queer_friendly", 0.0) >= criticality) or (
-        vc and scarcity.get("vinyl_collector", 0.0) >= criticality
-    ):
-        return True
-
-    # 6) Prioritized deficit-first for the hard attributes (<100%)
-    # Keep a slightly stricter gate: only prioritize if < 90% filled or scarce
-    for a in ("queer_friendly", "vinyl_collector", "german_speaker", "international"):
-        M = state.constraints.get(a, 0)
-        c = state.counts.get(a, 0)
-        if person.get(a, False) and M > 0:
-            if (c < 0.9 * M) or (scarcity.get(a, 0.0) >= 0.7):
-                return True
-
-    # 5) Endgame: conservative feasibility + EV
-    if R <= 120:
-        if not _feasible(person, state):
-            return False
-        return _expected_value(person, state, horizon=R) > 0.0
-
-    # 6) Scarcity-weighted scoring with required/base weights and correlation bonus
-    W = _weights_required_over_base(state)
-    s = 0.0
-
-    # Optional per-attribute weight boost/dampen to emphasize uncommon ones
-    boost = {
-        "queer_friendly": 2.0,
-        "vinyl_collector": 2.0,
-        "german_speaker": 1.25,
-        "international": 1.15,
-    }
-    dampen = {
-        # Stronger dampening on underground_veteran so they contribute less to score
-        "underground_veteran": 0.3,
-        # Softer dampening on fashion_forward
-        "fashion_forward": 0.5,
-    }
-
-    # Direct contribution and opportunity penalty
-    for a in state.constraints:
-        Sa = scarcity[a]
-        Wa = W[a] * boost.get(a, 1.0) * dampen.get(a, 1.0)
-        if person.get(a, False) and need[a] > 0:
-            s += 1.0 * Wa * (1.0 + 0.85 * Sa)
-        else:
-            if need[a] > 0:
-                s -= 0.6 * Wa * (1.0 + 0.7 * Sa)
-
-    # Additional negative bias: if ugv/ff are already at or above min, penalize
-    # to reduce their acceptance when they don't help deficits.
-    if person.get("underground_veteran", False) and need.get("underground_veteran", 0) <= 0:
-        s -= 0.8
-    if person.get("fashion_forward", False) and need.get("fashion_forward", 0) <= 0:
-        s -= 0.25
-
-    # Correlation-aware bonus toward needed, scarce targets
-    for at, v in person.items():
-        if not v:
-            continue
-        for an in state.constraints:
-            if need[an] <= 0:
-                continue
-            c = state.corr.get(at, {}).get(an, 0.0)
-            if c <= 0:
-                continue
-            Sa = scarcity[an]
-            Wa = W[an] * boost.get(an, 1.0)
-            s += 0.5 * c * Wa * (1.0 + 0.9 * Sa)
-
-    # 7) Adaptive threshold with recent rejection rate and pressure
-    threshold = _adaptive_threshold(
-        state,
-        rejection_history,
-        base_start=0.6,
-        window=min(100, max(10, state.total_seen if hasattr(state, "total_seen") else 100)),
-    )
-
-    # Slight easing when max scarcity is high
-    try:
-        max_s = max(scarcity.values()) if scarcity else 0.0
-        threshold *= (1.0 - min(0.2, 0.05 * max_s))
-    except Exception:
-        pass
-
-    # Make threshold stricter for ugv/ff when they don't help deficits.
-    # When QF/VC are < 50% padded target, be even stricter to leave room.
-    if (person.get("underground_veteran", False) or person.get("fashion_forward", False)) and not (
-        (qf and need_qf > 0) or (vc and need_vc > 0) or any(
-            person.get(a, False) and need.get(a, 0) > 0 for a in ("german_speaker", "international")
-        )
-    ):
-        # Recompute padded focus ratio (reuse above if available)
-        try:
-            qf_ratio_p = state.counts.get("queer_friendly", 0) / max(1, qf_min_padded)
-            vc_ratio_p = state.counts.get("vinyl_collector", 0) / max(1, vc_min_padded)
-            if min(qf_ratio_p, vc_ratio_p) < 0.5:
-                threshold *= 1.25
-            else:
-                # If UGV already over min, tighten further
-                if person.get("underground_veteran", False):
-                    ugv_ratio_cur = state.counts.get("underground_veteran", 0) / max(1, state.constraints.get("underground_veteran", 0))
-                    if ugv_ratio_cur >= 1.05:
-                        threshold *= 1.2
-                    else:
-                        threshold *= 1.1
-                else:
-                    threshold *= 1.1
-        except Exception:
-            threshold *= 1.1
-
-    return s >= threshold
+    # Final decision
+    return score >= threshold

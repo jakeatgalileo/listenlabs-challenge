@@ -1,5 +1,6 @@
 from typing import Dict, List
 from collections import deque
+import random
 
 # Track last accepted candidates' attributes for empirical frequency estimates
 _ACCEPTED_WINDOW = deque(maxlen=100)
@@ -79,85 +80,118 @@ def _adjusted_p(attr: str, state) -> float:
 
 
 def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool:
-    accept = False
-    # Fast accept-all once both minimums are met
-    need = _need_map(state)
-    if all(n <= 0 for n in need.values()):
-        accept = True
-    else:
-        # Strong feasibility guard (must accept/reject cases)
-        forced = _must_accept_or_reject_by_feasibility(person, state)
-        if "force" in forced:
-            accept = bool(forced["force"])  # True: must accept, False: must reject
-        else:
-            # Expect exactly two attributes in Scenario 1
-            attrs = list(state.constraints.keys())
-            if len(attrs) < 2:
-                # Fallback: if the single attr is present, accept, else reject unless already met
-                a = attrs[0]
-                accept = person.get(a, False) or (need[a] <= 0)
-            else:
-                a1, a2 = attrs[0], attrs[1]
+    """
+    Phase-based strategy tuned for Scenario 1 (two symmetric attributes).
 
-                has1 = bool(person.get(a1, False))
-                has2 = bool(person.get(a2, False))
+    Laxer on accepting (0,0) when safe to push meeting 600/600 closer to the end,
+    guarded by an LCB feasibility check.
+    """
 
-                # Simple early policy: until 90% capacity, accept anyone
-                # with at least one attribute; accept neither only if LCB
-                # feasibility holds for both constraints.
-                pre90 = state.admitted_count < int(0.9 * state.N)
-                if not accept and pre90:
-                    if has1 or has2:
-                        accept = True
-                    else:
-                        if _safe_accept_neither(state):
-                            accept = True
+    def _impl() -> bool:
+        has_young = bool(person.get("young", False))
+        has_wd = bool(person.get("well_dressed", False))
 
-                # Sprint-to-finish: if > 90% full and both nearly met (<=20 short), accept anyone with at least one attr
-                if state.admitted_count >= 900:
-                    nearly1 = (state.constraints[a1] - state.counts.get(a1, 0)) <= 20
-                    nearly2 = (state.constraints[a2] - state.counts.get(a2, 0)) <= 20
-                    if nearly1 and nearly2 and (has1 or has2):
-                        accept = True
-                    # else fall through to standard logic
+        M_young = int(state.constraints.get("young", 0))
+        M_wd = int(state.constraints.get("well_dressed", 0))
+        cur_young = int(state.counts.get("young", 0))
+        cur_wd = int(state.counts.get("well_dressed", 0))
 
-                # Phase logic
-                n1 = need[a1]
-                n2 = need[a2]
+        young_need = max(0, M_young - cur_young)
+        wd_need = max(0, M_wd - cur_wd)
+        remaining = max(0, state.N - state.admitted_count)
 
-                # Phase A: both below min
-                if not accept and n1 > 0 and n2 > 0:
-                    if has1 or has2:
-                        accept = True
-                    else:
-                        # Early capacity soak: accept neither if both constraints remain safely feasible
-                        if _safe_accept_neither(state):
-                            accept = True
+        # Phase C: both constraints met -> accept everyone
+        if young_need == 0 and wd_need == 0:
+            return True
 
-                # Phase B: one met, the other not -> primarily accept candidates with the unmet attr
-                if not accept and n1 <= 0 and n2 > 0:
-                    if has2:
-                        accept = True
-                    else:
-                        accept = _safe_wrong_side_accept(unmet_attr=a2, state=state)
-                if not accept and n2 <= 0 and n1 > 0:
-                    if has1:
-                        accept = True
-                    else:
-                        accept = _safe_wrong_side_accept(unmet_attr=a1, state=state)
+        # Feasibility guard: must accept if rejecting would make it impossible to meet a min
+        if remaining <= young_need:
+            return has_young
+        if remaining <= wd_need:
+            return has_wd
 
-                # Fallback (should be Phase C handled above): reject neither, else accept if any attr
-                if not accept:
-                    if has1 or has2:
-                        accept = True
-                    else:
-                        if _safe_accept_neither(state):
-                            accept = True
+        # Calibrated base rates and correlation insight
+        p_young = 0.3225
+        p_wd = 0.3225
+        correlation = 0.183  # Positive correlation; (1,1) occurs more than independence
 
-    # Record accepted candidate for empirical frequencies
-    if accept:
+        # Expected future arrivals for each attribute among remaining-1 after this decision
+        expected_young = max(0.0, (remaining - 1) * p_young)
+        expected_wd = max(0.0, (remaining - 1) * p_wd)
+
+        # Helper: dynamic probability for accepting a (neither) candidate when safe
+        def _neither_accept_prob() -> float:
+            a = state.admitted_count
+            if a < 300:
+                return 0.60
+            if a < 700:
+                return 0.40
+            if a < 900:
+                return 0.25
+            return 0.12
+
+        # Phase A: Both constraints unmet
+        if young_need > 0 and wd_need > 0:
+            # (1,1): always good
+            if has_young and has_wd:
+                return True
+            # Single-attribute: be selective using safety margin for that attribute
+            if has_young ^ has_wd:
+                safety_margin = (expected_young - young_need) if has_young else (expected_wd - wd_need)
+                if safety_margin < -5:
+                    return True  # behind; take it
+                elif safety_margin < 10:
+                    return random.random() < 0.7
+                elif safety_margin < 20:
+                    return random.random() < 0.4
+                else:
+                    return random.random() < 0.2
+            # Neither: if safe, accept with dynamic probability to delay hitting mins
+            if _safe_accept_neither(state):
+                return random.random() < _neither_accept_prob()
+            return False
+
+        # Phase B: young met, need well_dressed
+        if young_need == 0 and wd_need > 0:
+            if has_wd:
+                return True
+            if not has_young and not has_wd:
+                if _safe_accept_neither(state):
+                    return random.random() < _neither_accept_prob()
+            if has_young:
+                safety_margin = expected_wd - wd_need
+                if safety_margin > 20:
+                    return True
+                elif safety_margin > 10:
+                    return random.random() < 0.5
+                elif safety_margin > 5:
+                    return random.random() < 0.2
+                return False
+
+        # Phase B: well_dressed met, need young
+        if wd_need == 0 and young_need > 0:
+            if has_young:
+                return True
+            if not has_young and not has_wd:
+                if _safe_accept_neither(state):
+                    return random.random() < _neither_accept_prob()
+            if has_wd:
+                safety_margin = expected_young - young_need
+                if safety_margin > 20:
+                    return True
+                elif safety_margin > 10:
+                    return random.random() < 0.5
+                elif safety_margin > 5:
+                    return random.random() < 0.2
+                return False
+
+        # Default fallback (should be unreachable)
+        return True
+
+    decision = _impl()
+    if decision:
         _record_accept(person)
-    return accept
+    return decision
 
 
 def _safe_wrong_side_accept(unmet_attr: str, state) -> bool:
