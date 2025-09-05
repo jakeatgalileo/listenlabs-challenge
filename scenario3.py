@@ -18,6 +18,13 @@ _ATTR_INDEX: Dict[str, int] = {a: i for i, a in enumerate(ATTR_ORDER)}
 # Cached scores per game (lazy init)
 _SCORES: Optional[List[float]] = None
 
+# Global per-attribute adjustments applied when building the score array
+# Ignore underground_veteran and fashion_forward in acceptance scoring.
+# Emphasize vinyl_collector; slightly boost german_speaker and international.
+VC_SCORE_BONUS: float = 5.0
+GS_SCORE_BONUS: float = 2.0
+INT_SCORE_BONUS: float = 2.0
+
 """
 Granular scoring map (0–100 scale), keyed by
 (UV, INT, FF, QF, VC, GS) in that order, matching ATTR_ORDER.
@@ -170,29 +177,57 @@ def _weights_required_over_base(state: Any) -> Dict[str, float]:
 
 
 def _build_scores(state: Any) -> List[float]:
-    # With the granular map we directly fill a 64-size array;
-    # unspecified combos default to 0.0 (very low priority).
+    # Build a 64-length score table while ignoring UV and FF.
+    # Collapse the curated map across UV/FF and keep the max score
+    # for each core configuration of (INT, QF, VC, GS).
     scores = [0.0] * 64
+
+    core_max: Dict[Tuple[bool, bool, bool, bool], float] = {}
     for combo, val in SCORING_MAP.items():
-        scores[_tuple_to_key(combo)] = float(val)
+        core = (combo[1], combo[3], combo[4], combo[5])  # (INT, QF, VC, GS)
+        core_max[core] = max(core_max.get(core, 0.0), float(val))
+
+    # Fill all 64 combos using the core score, ignoring UV and FF
+    for uv in (False, True):
+        for intl in (False, True):
+            for ff in (False, True):
+                for qf in (False, True):
+                    for vc in (False, True):
+                        for gs in (False, True):
+                            core = (intl, qf, vc, gs)
+                            base = core_max.get(core, 0.0)
+
+                            bumped = base
+                            if vc:
+                                bumped += VC_SCORE_BONUS
+                            if gs:
+                                bumped += GS_SCORE_BONUS
+                            if intl:
+                                bumped += INT_SCORE_BONUS
+
+                            key_tuple = (uv, intl, ff, qf, vc, gs)
+                            scores[_tuple_to_key(key_tuple)] = max(0.0, min(100.0, bumped))
+
     return scores
 
 
 def _dynamic_threshold(state: Any) -> float:
     """Granular dynamic threshold on 0–100 scale.
-    Uses desperation ratios of GS/INT/QF relative to remaining slots.
+    Optimizes for INT, GS, QF, and VC only (ignores UV/FF).
     """
     remaining = max(1, state.N - state.admitted_count)
 
     gs_need = max(0, int(state.constraints.get("german_speaker", 0)) - int(state.counts.get("german_speaker", 0)))
     int_need = max(0, int(state.constraints.get("international", 0)) - int(state.counts.get("international", 0)))
     qf_need = max(0, int(state.constraints.get("queer_friendly", 0)) - int(state.counts.get("queer_friendly", 0)))
+    vc_need = max(0, int(state.constraints.get("vinyl_collector", 0)) - int(state.counts.get("vinyl_collector", 0)))
 
     gs_ratio = gs_need / remaining
     int_ratio = int_need / remaining
-    qf_ratio = (qf_need / remaining) / 3.0  # QF 3x discounted due to rarity weighting
+    qf_ratio = (qf_need / remaining) / 3.0  # QF discounted due to strong gating
+    vc_ratio = (vc_need / remaining) / 2.0  # VC moderate weight
 
-    max_ratio = max(gs_ratio, int_ratio, qf_ratio)
+    max_ratio = max(gs_ratio, int_ratio, qf_ratio, vc_ratio)
 
     if max_ratio >= 0.95:
         thr = 35.0  # Super desperate
@@ -205,11 +240,7 @@ def _dynamic_threshold(state: Any) -> float:
     else:
         thr = 55.0  # Comfortable
 
-    # Early-phase aggressiveness: be more permissive globally until QF reaches 90%
-    qf_prog = _progress(state, "queer_friendly")
-    if qf_prog < 0.90:
-        thr = min(thr, 40.0)
-
+    # Person-aware gating will enforce QF-only until 95%.
     return thr
 
 
@@ -236,12 +267,20 @@ def decide(person: Dict[str, bool], state: Any, rejection_history: List[int]) ->
     key = _person_to_key(person)
     score = _SCORES[key]
 
-    # Early auto-accept: favor QF strongly until reaching 90% of its minimum
-    if person.get("queer_friendly", False) and _progress(state, "queer_friendly") < 0.90:
+    # Early auto-accept: QF-only until reaching 95% of its minimum
+    if person.get("queer_friendly", False) and _progress(state, "queer_friendly") < 0.95:
         return True
+
+    # Until QF progress reaches 95%, block non-QF candidates
+    if _progress(state, "queer_friendly") < 0.95 and not person.get("queer_friendly", False):
+        return False
 
     # Dynamic thresholding (0–100 scale)
     threshold = _dynamic_threshold(state)
+
+    # Slightly favor vinyl collectors post-QF phase by easing threshold
+    if _progress(state, "queer_friendly") >= 0.95 and person.get("vinyl_collector", False):
+        threshold = max(30.0, threshold - 3.0)
 
     # Final decision
     return score >= threshold

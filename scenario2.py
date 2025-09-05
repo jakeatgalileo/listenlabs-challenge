@@ -47,28 +47,28 @@ SCORING_MAP_SCENARIO2: Dict[Tuple[bool, bool, bool, bool], float] = {
 
     # TIER 2: VERY HIGH PRIORITY (Score 8.0-9.0)
     # Creative with other helpful attributes
-    (True, True, True, False): 9.0,   # CR+TL+WC (no BL)
+    (True, True, True, False): 8.5,   # CR+TL+WC (no BL) — WC neutralized
     (True, False, True, False): 8.5,  # CR+TL only
-    (False, True, True, False): 8.5,  # CR+WC only
+    (False, True, True, False): 8.0,  # CR+WC only — WC neutralized
     (False, False, True, False): 8.0, # CR only (still very valuable)
 
     # Berlin local + techno_lover (fighting the negative correlation)
-    (True, True, False, True): 8.0,   # BL+TL+WC (all constraints)
-    (True, False, False, True): 8.0,  # BL+TL (rare due to -0.655 correlation)
+    (True, True, False, True): 9.0,   # BL+TL+WC (all constraints) — bumped
+    (True, False, False, True): 9.0,  # BL+TL (rare due to -0.655 correlation) — bumped
 
     # TIER 3: HIGH PRIORITY (Score 5.0-7.0)
     # Berlin local combinations (exploiting positive correlations)
-    (False, True, False, True): 7.0,  # BL+WC (positive correlation +0.572)
-    (False, False, False, True): 5.5, # BL only
+    (False, True, False, True): 7.0,  # BL+WC — WC neutralized to BL only
+    (False, False, False, True): 7.0, # BL only — further bump
 
     # TIER 4: MEDIUM PRIORITY (Score 2.5-4.0)
     # Techno_lover combinations (common but needed)
-    (True, True, False, False): 3.0,  # TL+WC (negative correlation -0.470)
-    (True, False, False, False): 3.5, # TL only (common, helps constraint)
+    (True, True, False, False): 4.5,  # TL+WC — WC neutralized to TL only
+    (True, False, False, False): 4.5, # TL only — bump
 
     # TIER 5: LOW PRIORITY (Score 1.0-2.0)
     # Well_connected only
-    (False, True, False, False): 2.0, # WC only
+    (False, True, False, False): 0.0, # WC only — ignored
 
     # TIER 6: REJECT (Score 0.0)
     (False, False, False, False): 0.0, # No attributes
@@ -131,20 +131,26 @@ def get_dynamic_score_adjustment(person: Dict[str, bool], state) -> float:
     bl_prog = _progress(state, A_B)
     cr_prog = _progress(state, A_C)
     tl_prog = _progress(state, A_T)
-    # wc_prog = _progress(state, A_W)  # not directly used, kept for tuning
+    # wc_prog intentionally unused: WC treated as neutral in scoring
 
-    if person.get(A_B) and bl_prog < 0.7:
+    if person.get(A_B) and bl_prog < 0.85:
         adj += 1.5
     if person.get(A_C) and cr_prog < 0.7:
         adj += 2.0
+
+    # Boost TL when lagging toward its minimum
+    if person.get(A_T) and tl_prog < 0.95:
+        adj += 1.0
 
     # Rare BL ∧ TL combo boost
     if person.get(A_B) and person.get(A_T):
         adj += 1.0
 
     # TL‑only penalty when TL is already well on track and no BL
-    if person.get(A_T) and not person.get(A_B) and tl_prog > 0.9:
+    if person.get(A_T) and not person.get(A_B) and tl_prog > 0.98:
         adj -= 1.0
+
+    # No explicit WC adjustments: we treat WC as neutral unless required by safety
 
     return adj
 
@@ -152,20 +158,13 @@ def get_dynamic_score_adjustment(person: Dict[str, bool], state) -> float:
 def _dynamic_threshold(state, base: float = BASE_THRESHOLD_SCENARIO2) -> float:
     """Base threshold modulation from state only.
 
-    More aggressive early phase until creative reaches 85% of its minimum
-    (lower acceptance threshold broadly to speed initial progress).
+    Keep neutral thresholding by default; person-aware shaping below will
+    implement the aggressive early behavior (creative-only until 95%).
     """
     if _all_minima_met(state):
         return 0.0
     bl_prog = _progress(state, A_B)
     cr_prog = _progress(state, A_C)
-
-    # Early-phase: be much more permissive until creatives reach 85%
-    if cr_prog < 0.85:
-        # Lower the global threshold substantially in the beginning
-        return max(1.0, base - 1.5)
-
-    # If both BL and CR are lagging moderately, still ease a bit
     if bl_prog < 0.7 and cr_prog < 0.7:
         return max(2.0, base - 0.3)
     return base
@@ -173,15 +172,20 @@ def _dynamic_threshold(state, base: float = BASE_THRESHOLD_SCENARIO2) -> float:
 
 def _threshold_for(person: Dict[str, bool], state) -> float:
     """Person-aware threshold shaping:
-    - Auto-accept creatives until they hit 85% of their minimum (handled in decide).
-    - After creatives reach 85%, ease threshold by 0.5 for creative candidates
+    - Auto-accept creatives until they hit 95% of their minimum (handled in decide).
+    - After creatives reach 95%, ease threshold by 0.5 for creative candidates
       to continue favoring them without auto-accepting.
     """
     thr = _dynamic_threshold(state)
-    if person.get(A_C, False):
-        cr_prog = _progress(state, A_C)
-        if cr_prog >= 0.85:
-            thr = max(1.5, thr - 0.5)
+    cr_prog = _progress(state, A_C)
+
+    # Until creative progress reaches 95%, effectively block non-creative candidates
+    if cr_prog < 0.95 and not person.get(A_C, False):
+        return 1e9  # impossible bar for non-creative early
+
+    # After creatives 95%+, still give them a small threshold easing
+    if person.get(A_C, False) and cr_prog >= 0.95:
+        thr = max(1.5, thr - 0.5)
     return thr
 
 
@@ -198,9 +202,9 @@ def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool
     if _remaining(state) <= ENDGAME_REMAINING and not _feasible_if_accept(person, state):
         return False
 
-    # 3.5) Creative auto-accept until 85% of minimum is reached
+    # 3.5) Creative auto-accept until 95% of minimum is reached
     if person.get(A_C, False):
-        if _progress(state, A_C) < 0.85:
+        if _progress(state, A_C) < 0.95:
             return True
 
     # 4) Curated 16-combo score + dynamic adjustment

@@ -52,135 +52,30 @@ def _adjusted_p(attr: str, state) -> float:
 
 def decide(person: Dict[str, bool], state, rejection_history: List[int]) -> bool:
     """
-    Phase-based strategy tuned for Scenario 1 (two symmetric attributes).
-
-    Laxer on accepting (0,0) when safe to push meeting 600/600 closer to the end,
-    guarded by an LCB feasibility check.
+    Greedy strategy (per request):
+    - Accept any candidate who has at least one of the constrained attributes.
+    - Reject candidates with neither attribute.
+    - Once both minima are met, accept everyone.
+    - Always enforce feasibility: if accepting would make it impossible to
+      meet any remaining minimum (because the candidate lacks that attribute
+      and there aren’t enough seats left), reject.
     """
 
-    def _impl() -> bool:
-        has_young = bool(person.get("young", False))
-        has_wd = bool(person.get("well_dressed", False))
-
-        M_young = int(state.constraints.get("young", 0))
-        M_wd = int(state.constraints.get("well_dressed", 0))
-        cur_young = int(state.counts.get("young", 0))
-        cur_wd = int(state.counts.get("well_dressed", 0))
-
-        young_need = max(0, M_young - cur_young)
-        wd_need = max(0, M_wd - cur_wd)
-        remaining = max(0, state.N - state.admitted_count)
-
-        # Phase C: both constraints met -> accept everyone
-        if young_need == 0 and wd_need == 0:
-            return True
-
-        # Feasibility guard: must accept if rejecting would make it impossible to meet a min
-        if remaining <= young_need:
-            return has_young
-        if remaining <= wd_need:
-            return has_wd
-
-        # Calibrated base rates and correlation insight
-        p_young = 0.3225
-        p_wd = 0.3225
-
-        # Expected future arrivals for each attribute among remaining-1 after this decision
-        expected_young = max(0.0, (remaining - 1) * p_young)
-        expected_wd = max(0.0, (remaining - 1) * p_wd)
-
-        # Helper: dynamic probability for accepting a (neither) candidate when safe
-        def _neither_accept_prob() -> float:
-            """More aggressive acceptance for (neither) — especially near end.
-
-            Base schedule is bumped up overall, and we apply an endgame ramp
-            based on remaining spots to be deliberately more permissive while the
-            LCB feasibility guard continues to ensure we can still reach 600/600.
-            """
-            a = state.admitted_count
-            R = max(0, state.N - state.admitted_count)
-
-            # Bumped base schedule by admitted progress
-            if a < 300:
-                p = 0.70  # was 0.60
-            elif a < 700:
-                p = 0.55  # was 0.40
-            elif a < 900:
-                p = 0.40  # was 0.25
-            else:
-                p = 0.25  # was 0.12
-
-            # Endgame ramp: as remaining shrinks, be even more permissive
-            if R <= 30:
-                p = max(p, 0.95)
-            elif R <= 50:
-                p = max(p, 0.85)
-            elif R <= 80:
-                p = max(p, 0.70)
-            elif R <= 120:
-                p = max(p, 0.50)
-
-            return p
-
-        # Phase A: Both constraints unmet
-        if young_need > 0 and wd_need > 0:
-            # (1,1): always good
-            if has_young and has_wd:
-                return True
-            # Single-attribute: be selective using safety margin for that attribute
-            if has_young ^ has_wd:
-                safety_margin = (expected_young - young_need) if has_young else (expected_wd - wd_need)
-                if safety_margin < -5:
-                    return True  # behind; take it
-                elif safety_margin < 10:
-                    return random.random() < 0.7
-                elif safety_margin < 20:
-                    return random.random() < 0.4
-                else:
-                    return random.random() < 0.2
-            # Neither: if safe, accept with dynamic probability to delay hitting mins
-            if _safe_accept_neither(state):
-                return random.random() < _neither_accept_prob()
-            return False
-
-        # Phase B: young met, need well_dressed
-        if young_need == 0 and wd_need > 0:
-            if has_wd:
-                return True
-            if not has_young and not has_wd:
-                if _safe_accept_neither(state):
-                    return random.random() < _neither_accept_prob()
-            if has_young:
-                safety_margin = expected_wd - wd_need
-                if safety_margin > 20:
-                    return True
-                elif safety_margin > 10:
-                    return random.random() < 0.5
-                elif safety_margin > 5:
-                    return random.random() < 0.2
-                return False
-
-        # Phase B: well_dressed met, need young
-        if wd_need == 0 and young_need > 0:
-            if has_young:
-                return True
-            if not has_young and not has_wd:
-                if _safe_accept_neither(state):
-                    return random.random() < _neither_accept_prob()
-            if has_wd:
-                safety_margin = expected_young - young_need
-                if safety_margin > 20:
-                    return True
-                elif safety_margin > 10:
-                    return random.random() < 0.5
-                elif safety_margin > 5:
-                    return random.random() < 0.2
-                return False
-
-        # Default fallback (should be unreachable)
+    # If both minima are already met, accept-all to minimize rejections
+    needs = {a: max(0, int(state.constraints.get(a, 0)) - int(state.counts.get(a, 0))) for a in state.constraints}
+    if all(n == 0 for n in needs.values()):
         return True
 
-    decision = _impl()
+    # Hard feasibility: if candidate lacks some attr `a` and taking this seat
+    # would leave fewer than `need[a]` seats, we must reject.
+    R = max(0, int(state.N) - int(state.admitted_count))
+    for a, need in needs.items():
+        if not person.get(a, False) and (R - 1) < need:
+            return False
+
+    # Greedy accept if any constrained attribute is present; else reject
+    has_any = any(person.get(a, False) for a in state.constraints)
+    decision = bool(has_any)
     if decision:
         _record_accept(person)
     return decision
